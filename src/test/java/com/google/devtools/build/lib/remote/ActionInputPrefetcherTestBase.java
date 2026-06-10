@@ -13,6 +13,7 @@
 // limitations under the License.
 package com.google.devtools.build.lib.remote;
 
+import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static com.google.common.truth.Truth.assertThat;
@@ -94,6 +95,8 @@ public abstract class ActionInputPrefetcherTestBase {
   private static class DelayedChmodFileSystem extends DelegateFileSystem {
 
     private Duration chmodDelay = Duration.ZERO;
+    @Nullable private Semaphore chmodStarted;
+    @Nullable private Semaphore chmodMayContinue;
 
     DelayedChmodFileSystem(FileSystem delegateFs) {
       super(delegateFs);
@@ -101,6 +104,23 @@ public abstract class ActionInputPrefetcherTestBase {
 
     @Override
     public void chmod(PathFragment path, int mode) throws IOException {
+      Semaphore started;
+      Semaphore mayContinue;
+      synchronized (this) {
+        started = chmodStarted;
+        mayContinue = chmodMayContinue;
+        chmodStarted = null;
+        chmodMayContinue = null;
+      }
+      if (started != null) {
+        started.release();
+        try {
+          checkNotNull(mayContinue).acquire();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IOException(e);
+        }
+      }
       if (!chmodDelay.isZero()) {
         try {
           Thread.sleep(chmodDelay.toMillis());
@@ -113,6 +133,11 @@ public abstract class ActionInputPrefetcherTestBase {
 
     void setChmodDelay(Duration chmodDelay) {
       this.chmodDelay = chmodDelay;
+    }
+
+    synchronized void blockNextChmod(Semaphore chmodStarted, Semaphore chmodMayContinue) {
+      this.chmodStarted = chmodStarted;
+      this.chmodMayContinue = chmodMayContinue;
     }
   }
 
@@ -664,6 +689,238 @@ public abstract class ActionInputPrefetcherTestBase {
 
     f1.get();
     f2.get();
+  }
+
+  @Test
+  public void prefetchFiles_treeFiles_concurrentDownloads_keepDirectoriesWritable()
+      throws Exception {
+    Map<ActionInput, FileArtifactValue> metadata = new HashMap<>();
+    Map<HashCode, byte[]> cas = new HashMap<>();
+    Pair<SpecialArtifact, ImmutableList<TreeFileArtifact>> treeAndChildren =
+        createRemoteTreeArtifact(
+            "dir",
+            /* localContentMap= */ ImmutableMap.of(),
+            /* remoteContentMap= */ ImmutableMap.of(
+                "subdir1/file1", "content1", "subdir2/file2", "content2"),
+            metadata,
+            cas);
+    SpecialArtifact tree = treeAndChildren.getFirst();
+    PathFragment root = tree.getPath().asFragment();
+    Path firstSubdir = tree.getPath().getChild("subdir1");
+    Path secondSubdir = tree.getPath().getChild("subdir2");
+    ImmutableList<TreeFileArtifact> children = treeAndChildren.getSecond();
+
+    SettableFuture<Void> firstDownload = SettableFuture.create();
+    SettableFuture<Void> secondDownload = SettableFuture.create();
+    LinkedBlockingQueue<ListenableFuture<Void>> downloads = new LinkedBlockingQueue<>();
+    downloads.add(firstDownload);
+    downloads.add(secondDownload);
+    AbstractActionInputPrefetcher prefetcher = spy(createPrefetcher(cas));
+    mockDownload(prefetcher, cas, downloads::remove);
+    reset(fs);
+
+    ListenableFuture<Void> firstPrefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action,
+            ImmutableList.of(children.get(0)),
+            metadata::get,
+            Priority.MEDIUM,
+            Reason.INPUTS);
+    ListenableFuture<Void> secondPrefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action,
+            ImmutableList.of(children.get(1)),
+            metadata::get,
+            Priority.MEDIUM,
+            Reason.INPUTS);
+    assertThat(downloads).isEmpty();
+
+    firstDownload.set(null);
+    wait(firstPrefetch);
+
+    assertThat(secondPrefetch.isDone()).isFalse();
+    verify(fs, never()).chmod(root, 0555);
+    verify(fs).chmod(firstSubdir.asFragment(), 0555);
+    verify(fs, never()).chmod(secondSubdir.asFragment(), 0555);
+    assertReadableWritableAndExecutable(tree.getPath());
+    assertReadableNonWritableAndExecutable(firstSubdir);
+    assertThat(secondSubdir.exists()).isFalse();
+
+    secondDownload.set(null);
+    wait(secondPrefetch);
+
+    verify(fs).chmod(root, 0555);
+    verify(fs).chmod(secondSubdir.asFragment(), 0555);
+    assertTreeReadableNonWritableAndExecutable(tree.getPath());
+  }
+
+  @Test
+  public void prefetchFiles_treeFiles_failedDownload_preservesError() throws Exception {
+    Map<ActionInput, FileArtifactValue> metadata = new HashMap<>();
+    Map<HashCode, byte[]> cas = new HashMap<>();
+    Pair<SpecialArtifact, ImmutableList<TreeFileArtifact>> treeAndChildren =
+        createRemoteTreeArtifact(
+            "dir",
+            /* localContentMap= */ ImmutableMap.of(),
+            /* remoteContentMap= */ ImmutableMap.of("subdir/file", "content"),
+            metadata,
+            cas);
+    SpecialArtifact tree = treeAndChildren.getFirst();
+    Artifact child = Iterables.getOnlyElement(treeAndChildren.getSecond());
+
+    SettableFuture<Void> download = SettableFuture.create();
+    AbstractActionInputPrefetcher prefetcher = spy(createPrefetcher(cas));
+    mockDownload(prefetcher, cas, () -> download);
+    ListenableFuture<Void> prefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action, ImmutableList.of(child), metadata::get, Priority.MEDIUM, Reason.INPUTS);
+
+    IOException downloadFailure = new IOException("download failed");
+    download.setException(downloadFailure);
+
+    BulkTransferException failure = assertThrows(BulkTransferException.class, () -> wait(prefetch));
+    assertThat(ImmutableList.copyOf(failure.getSuppressed())).containsExactly(downloadFailure);
+    assertThat(tree.getPath().exists()).isFalse();
+  }
+
+  @Test
+  public void prefetchFiles_treeFiles_cancelledDownload_doesNotCreateDirectories()
+      throws Exception {
+    Map<ActionInput, FileArtifactValue> metadata = new HashMap<>();
+    Map<HashCode, byte[]> cas = new HashMap<>();
+    Pair<SpecialArtifact, ImmutableList<TreeFileArtifact>> treeAndChildren =
+        createRemoteTreeArtifact(
+            "dir",
+            /* localContentMap= */ ImmutableMap.of(),
+            /* remoteContentMap= */ ImmutableMap.of("subdir/file", "content"),
+            metadata,
+            cas);
+    SpecialArtifact tree = treeAndChildren.getFirst();
+    Artifact child = Iterables.getOnlyElement(treeAndChildren.getSecond());
+
+    SettableFuture<Void> download = SettableFuture.create();
+    AbstractActionInputPrefetcher prefetcher = spy(createPrefetcher(cas));
+    mockDownload(prefetcher, cas, () -> download);
+    ListenableFuture<Void> prefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action, ImmutableList.of(child), metadata::get, Priority.MEDIUM, Reason.INPUTS);
+
+    prefetch.cancel(/* mayInterruptIfRunning= */ true);
+
+    assertThat(download.isCancelled()).isTrue();
+    assertThat(tree.getPath().exists()).isFalse();
+  }
+
+  @Test
+  public void prefetchFiles_treeFiles_cancellationWaitsForFinalization() throws Exception {
+    Map<ActionInput, FileArtifactValue> metadata = new HashMap<>();
+    Map<HashCode, byte[]> cas = new HashMap<>();
+    Pair<SpecialArtifact, ImmutableList<TreeFileArtifact>> treeAndChildren =
+        createRemoteTreeArtifact(
+            "dir",
+            /* localContentMap= */ ImmutableMap.of(),
+            /* remoteContentMap= */ ImmutableMap.of("subdir/file", "content"),
+            metadata,
+            cas);
+    SpecialArtifact tree = treeAndChildren.getFirst();
+    Artifact child = Iterables.getOnlyElement(treeAndChildren.getSecond());
+
+    SettableFuture<Void> download = SettableFuture.create();
+    AbstractActionInputPrefetcher prefetcher = spy(createPrefetcher(cas));
+    mockDownload(prefetcher, cas, () -> download);
+    ListenableFuture<Void> prefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action, ImmutableList.of(child), metadata::get, Priority.MEDIUM, Reason.INPUTS);
+
+    Semaphore finalizationStarted = new Semaphore(0);
+    Semaphore finalizationMayContinue = new Semaphore(0);
+    ((DelayedChmodFileSystem) fs.getDelegateFs())
+        .blockNextChmod(finalizationStarted, finalizationMayContinue);
+    Thread completionThread = new Thread(() -> download.set(null));
+    completionThread.start();
+    assertThat(finalizationStarted.tryAcquire(10, SECONDS)).isTrue();
+
+    Semaphore cancellationFinished = new Semaphore(0);
+    Thread cancellationThread =
+        new Thread(
+            () -> {
+              prefetch.cancel(/* mayInterruptIfRunning= */ true);
+              cancellationFinished.release();
+            });
+    cancellationThread.start();
+
+    assertThat(cancellationFinished.tryAcquire(1, SECONDS)).isFalse();
+    finalizationMayContinue.release();
+    assertThat(cancellationFinished.tryAcquire(10, SECONDS)).isTrue();
+    completionThread.join(10_000);
+    cancellationThread.join(10_000);
+
+    assertThat(completionThread.isAlive()).isFalse();
+    assertThat(cancellationThread.isAlive()).isFalse();
+    assertTreeReadableNonWritableAndExecutable(tree.getPath());
+  }
+
+  @Test
+  public void prefetchFiles_treeFiles_failedAndCancelledDownloads_releaseDirectories()
+      throws Exception {
+    Map<ActionInput, FileArtifactValue> metadata = new HashMap<>();
+    Map<HashCode, byte[]> cas = new HashMap<>();
+    Pair<SpecialArtifact, ImmutableList<TreeFileArtifact>> treeAndChildren =
+        createRemoteTreeArtifact(
+            "dir",
+            /* localContentMap= */ ImmutableMap.of(),
+            /* remoteContentMap= */ ImmutableMap.of(
+                "subdir/file1", "content1", "subdir/file2", "content2", "subdir/file3", "content3"),
+            metadata,
+            cas);
+    SpecialArtifact tree = treeAndChildren.getFirst();
+    ImmutableList<TreeFileArtifact> children = treeAndChildren.getSecond();
+
+    SettableFuture<Void> failedDownload = SettableFuture.create();
+    SettableFuture<Void> cancelledDownload = SettableFuture.create();
+    SettableFuture<Void> successfulDownload = SettableFuture.create();
+    LinkedBlockingQueue<ListenableFuture<Void>> downloads = new LinkedBlockingQueue<>();
+    downloads.add(failedDownload);
+    downloads.add(cancelledDownload);
+    downloads.add(successfulDownload);
+    AbstractActionInputPrefetcher prefetcher = spy(createPrefetcher(cas));
+    mockDownload(prefetcher, cas, downloads::remove);
+
+    ListenableFuture<Void> failedPrefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action,
+            ImmutableList.of(children.get(0)),
+            metadata::get,
+            Priority.MEDIUM,
+            Reason.INPUTS);
+    ListenableFuture<Void> cancelledPrefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action,
+            ImmutableList.of(children.get(1)),
+            metadata::get,
+            Priority.MEDIUM,
+            Reason.INPUTS);
+    ListenableFuture<Void> successfulPrefetch =
+        prefetcher.prefetchFilesInterruptibly(
+            action,
+            ImmutableList.of(children.get(2)),
+            metadata::get,
+            Priority.MEDIUM,
+            Reason.INPUTS);
+    assertThat(downloads).isEmpty();
+
+    successfulDownload.set(null);
+    wait(successfulPrefetch);
+    assertTreeReadableWritableAndExecutable(tree.getPath());
+
+    failedDownload.setException(new IOException("download failed"));
+    assertThrows(IOException.class, () -> wait(failedPrefetch));
+    assertTreeReadableWritableAndExecutable(tree.getPath());
+
+    cancelledPrefetch.cancel(/* mayInterruptIfRunning= */ true);
+    assertThat(cancelledDownload.isCancelled()).isTrue();
+
+    assertTreeReadableNonWritableAndExecutable(tree.getPath());
   }
 
   @Test
