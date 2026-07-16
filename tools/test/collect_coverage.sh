@@ -78,14 +78,14 @@ fi
 # write coverage data outside of the runfiles tree
 export COVERAGE_DIR=${COVERAGE_DIR:-"$ROOT/coverage"}
 # make COVERAGE_DIR an absolute path
-if ! [[ $COVERAGE_DIR == $ROOT* ]]; then
+if [[ "$COVERAGE_DIR" != /* ]]; then
   COVERAGE_DIR=$ROOT/$COVERAGE_DIR
 fi
 
 mkdir -p "$COVERAGE_DIR"
 COVERAGE_OUTPUT_FILE=${COVERAGE_OUTPUT_FILE:-"$COVERAGE_DIR/_coverage.dat"}
 # make COVERAGE_OUTPUT_FILE an absolute path
-if ! [[ $COVERAGE_OUTPUT_FILE == $ROOT* ]]; then
+if [[ "$COVERAGE_OUTPUT_FILE" != /* ]]; then
   COVERAGE_OUTPUT_FILE=$ROOT/$COVERAGE_OUTPUT_FILE
 fi
 

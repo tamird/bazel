@@ -1,6 +1,7 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -25,6 +26,13 @@ filegroup(
 filegroup(
     name = "collect_coverage",
     srcs = ["collect_coverage.sh"],
+)
+
+sh_test(
+    name = "collect_coverage_test",
+    srcs = ["collect_coverage_test.sh"],
+    data = [":collect_coverage"],
+    tags = ["no_windows"],
 )
 
 filegroup(
