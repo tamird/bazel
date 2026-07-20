@@ -644,18 +644,19 @@ public class ResourceManager implements ResourceEstimator {
     }
   }
 
-  private boolean isAvailable(double available, double used, double requested) {
+  private boolean isAvailable(
+      double available, double trackedUsage, double effectiveUsage, double requested) {
     // Resources are considered available if any one of the conditions below is true:
     // 1) If resource is not requested at all, it is available.
-    // 2) If resource is not used at the moment and the flag
+    // 2) If tracked resource usage is zero and the flag
     // "allow_one_action_on_resource_unavailable" is enabled, it is considered to be
     // available regardless of how much is requested. This is necessary to
     // ensure that at any given time, at least one thread is able to acquire
     // resources even if it requests more than available.
-    // 3) If used resource amount is less than total available resource amount.
+    // 3) If effective usage plus the request is within the available resources.
     return requested == 0
-        || (allowOneActionOnResourceUnavailable && used == 0)
-        || used + requested <= available;
+        || (allowOneActionOnResourceUnavailable && trackedUsage == 0)
+        || effectiveUsage + requested <= available;
   }
 
   // Method will return true if all requested resources are considered to be available.
@@ -679,7 +680,10 @@ public class ResourceManager implements ResourceEstimator {
 
     int availableLocalTestCount = availableResources.getLocalTestCount();
     if (!isAvailable(
-        availableLocalTestCount, usedLocalTestCount, resources.getLocalTestCount())) {
+        availableLocalTestCount,
+        usedLocalTestCount,
+        usedLocalTestCount,
+        resources.getLocalTestCount())) {
       return false;
     }
 
@@ -694,14 +698,15 @@ public class ResourceManager implements ResourceEstimator {
           resource.getValue() * MIN_NECESSARY_RATIO.getOrDefault(key, DEFAULT_MIN_NECESSARY_RATIO);
       double used = usedResources.getOrDefault(key, 0.0);
       double available = availableResources.get(key);
+      double effectiveUsage = used;
       if (key.equals(ResourceSet.CPU) && cpuLoadScheduling) {
-        // Don't allow to run more than x3 of number cores actions simultaneously.
-        if (runningActions >= MAX_ACTIONS_PER_CPU * available) {
+        // Allow the first action past the cap; otherwise cap running actions at x3 CPU.
+        if (runningActions != 0 && runningActions >= MAX_ACTIONS_PER_CPU * available) {
           return false;
         }
-        used = windowEstimationCpu + machineLoadProvider.getCurrentCpuUsage();
+        effectiveUsage = windowEstimationCpu + machineLoadProvider.getCurrentCpuUsage();
       }
-      if (!isAvailable(available, used, requested)) {
+      if (!isAvailable(available, used, effectiveUsage, requested)) {
         return false;
       }
     }
