@@ -609,10 +609,10 @@ public class ResourceManager implements ResourceEstimator {
     }
   }
 
-  private <T extends Number> boolean isAvailable(
-      T available, T used, T requested, String resourceName) throws UserExecException {
+  private boolean isAvailable(double available, double used, double requested, String resourceName)
+      throws UserExecException {
     if (!allowOneActionOnResourceUnavailable
-        && available.doubleValue() + used.doubleValue() < requested.doubleValue()) {
+        && available + used < requested) {
       throw new UserExecException(
           FailureDetails.FailureDetail.newBuilder()
               .setMessage(
@@ -636,9 +636,9 @@ public class ResourceManager implements ResourceEstimator {
     // ensure that at any given time, at least one thread is able to acquire
     // resources even if it requests more than available.
     // 3) If used resource amount is less than total available resource amount.
-    return requested.doubleValue() == 0
-        || (allowOneActionOnResourceUnavailable && used.doubleValue() == 0)
-        || used.doubleValue() + requested.doubleValue() <= available.doubleValue();
+    return requested == 0
+        || (allowOneActionOnResourceUnavailable && used == 0)
+        || used + requested <= available;
   }
 
   // Method will return true if all requested resources are considered to be available.
@@ -671,13 +671,6 @@ public class ResourceManager implements ResourceEstimator {
 
     for (Map.Entry<String, Double> resource : resources.getResources().entrySet()) {
       String key = resource.getKey();
-
-      if (key.equals(ResourceSet.CPU)) {
-        if (!isCpuAvailable(resource)) {
-          return false;
-        }
-        continue;
-      }
       // Use only MIN_NECESSARY_RATIO of the resource value to check for
       // allocation. This is necessary to account for the fact that most of the
       // requested resource sets use pessimistic estimations. Note that this
@@ -687,32 +680,20 @@ public class ResourceManager implements ResourceEstimator {
           resource.getValue() * MIN_NECESSARY_RATIO.getOrDefault(key, DEFAULT_MIN_NECESSARY_RATIO);
       double used = usedResources.getOrDefault(key, 0.0);
       double available = availableResources.get(key);
+      if (key.equals(ResourceSet.CPU) && cpuLoadScheduling) {
+        double currentUsage = machineLoadProvider.getCurrentCpuUsage();
+        double windowEstimation = windowEstimationCpu;
+        // Don't allow to run more than x3 of number cores actions simultaneously.
+        if (runningActions >= MAX_ACTIONS_PER_CPU * available) {
+          return false;
+        }
+        used = windowEstimation + currentUsage;
+      }
       if (!isAvailable(available, used, requested, key)) {
         return false;
       }
     }
     return true;
-  }
-
-  synchronized boolean isCpuAvailable(Map.Entry<String, Double> resource) throws UserExecException {
-    String key = resource.getKey();
-
-    double requested =
-        resource.getValue() * MIN_NECESSARY_RATIO.getOrDefault(key, DEFAULT_MIN_NECESSARY_RATIO);
-    double available = availableResources.get(key);
-    double used = usedResources.getOrDefault(key, 0.0);
-
-    if (cpuLoadScheduling) {
-      double currentUsage = machineLoadProvider.getCurrentCpuUsage();
-      double windowEstimation = windowEstimationCpu;
-      // Don't allow to run more than x3 of number cores actions simultaneously.
-      if (runningActions >= MAX_ACTIONS_PER_CPU * availableResources.get(ResourceSet.CPU)) {
-        return false;
-      }
-      return isAvailable(available, windowEstimation + currentUsage, requested, key);
-    }
-
-    return isAvailable(available, used, requested, key);
   }
 
   @VisibleForTesting
