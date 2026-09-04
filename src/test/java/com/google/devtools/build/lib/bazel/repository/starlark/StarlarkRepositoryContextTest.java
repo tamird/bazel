@@ -17,7 +17,7 @@ package com.google.devtools.build.lib.bazel.repository.starlark;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -175,7 +175,7 @@ public final class StarlarkRepositoryContextTest {
         .thenReturn(
             PackageLookupValue.success(
                 Root.fromPath(workspaceFile.getParentDirectory()), BuildFileName.BUILD));
-    when(environment.getValueOrThrow(any(), eq(IOException.class)))
+    when(environment.getValue(argThat(key -> key instanceof FileValue.Key)))
         .thenReturn(Mockito.mock(FileValue.class));
     PathPackageLocator packageLocator =
         new PathPackageLocator(
