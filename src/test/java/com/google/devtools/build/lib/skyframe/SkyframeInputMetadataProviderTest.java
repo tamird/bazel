@@ -39,11 +39,14 @@ import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.skyframe.MemoizingEvaluator;
 import com.google.devtools.build.skyframe.SkyFunction;
+import com.google.testing.junit.testparameterinjector.TestParameter;
+import com.google.testing.junit.testparameterinjector.TestParameterInjector;
+import java.util.HashSet;
+import java.util.Set;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.junit.runners.JUnit4;
 
-@RunWith(JUnit4.class)
+@RunWith(TestParameterInjector.class)
 public class SkyframeInputMetadataProviderTest extends FoundationTestCase {
   // The behavior this test verifies (that SkyValues are memoized over multiple restarts) is not
   // actually necessary for the SkyframeInputMetadataProvider, but only due to a pretty brittle
@@ -55,7 +58,8 @@ public class SkyframeInputMetadataProviderTest extends FoundationTestCase {
   // it's useful to signal to someone who would remove this memoization, either accidentally or
   // intentionally.
   @Test
-  public void skyframeLookupsMemoizedOverMultipleRestarts() throws Exception {
+  public void skyframeLookupsMemoizedOverMultipleRestarts(@TestParameter boolean remote)
+      throws Exception {
     StaticInputMetadataProvider perBuild = new StaticInputMetadataProvider(ImmutableMap.of());
 
     ActionLookupKey owner = ActionsTestUtil.createActionLookupKey("owner");
@@ -72,6 +76,8 @@ public class SkyframeInputMetadataProviderTest extends FoundationTestCase {
     MemoizingEvaluator evaluator = mock(MemoizingEvaluator.class);
     SkyframeInputMetadataProvider simp =
         new SkyframeInputMetadataProvider(evaluator, perBuild, "out");
+    Set<PathFragment> discoveredPaths = new HashSet<>();
+    simp.setDiscoveredInputPathReceiver(discoveredPaths::add);
 
     // On the first iteration, the dependency is not available yet. getInputMetadataChecked()
     // should accordingly throw.
@@ -81,8 +87,14 @@ public class SkyframeInputMetadataProviderTest extends FoundationTestCase {
     try (var unused = simp.withSkyframeAllowed(env1)) {
       assertThrows(MissingDepExecException.class, () -> simp.getInputMetadataChecked(artifact));
     }
+    assertThat(discoveredPaths).isEmpty();
 
     FileArtifactValue metadata = FileArtifactValue.createForTesting(artifact);
+    if (remote) {
+      metadata =
+          FileArtifactValue.createForRemoteFile(
+              metadata.getDigest(), metadata.getSize(), /* locationIndex= */ 1);
+    }
     ActionExecutionValue aev =
         ActionExecutionValue.create(
             ImmutableMap.of(artifact, metadata),
@@ -96,6 +108,11 @@ public class SkyframeInputMetadataProviderTest extends FoundationTestCase {
     when(env2.getValue(actionKey)).thenReturn(aev);
     try (var unused = simp.withSkyframeAllowed(env2)) {
       assertThat(simp.getInputMetadataChecked(artifact)).isEqualTo(metadata);
+    }
+    if (remote) {
+      assertThat(discoveredPaths).containsExactly(artifact.getExecPath());
+    } else {
+      assertThat(discoveredPaths).isEmpty();
     }
 
     // No further methods on env3 or the evaluator should be called and the metadata should still be

@@ -34,6 +34,7 @@ import com.google.devtools.build.skyframe.SkyValue;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import javax.annotation.Nullable;
 
 /**
@@ -114,6 +115,7 @@ final class SkyframeInputMetadataProvider implements InputMetadataProvider {
   private final PathFragment relativeOutputPath;
 
   private final ConcurrentHashMap<PathFragment, ActionInput> seen;
+  @Nullable private Consumer<PathFragment> discoveredInputPathReceiver;
 
   /**
    * A cache so that we don't need to look up any SkyValue twice.
@@ -160,6 +162,14 @@ final class SkyframeInputMetadataProvider implements InputMetadataProvider {
     };
   }
 
+  /**
+   * Installs the callback before input discovery starts. The callback may be invoked concurrently
+   * during discovery.
+   */
+  void setDiscoveredInputPathReceiver(Consumer<PathFragment> receiver) {
+    this.discoveredInputPathReceiver = receiver;
+  }
+
   @Nullable
   @Override
   public FileArtifactValue getInputMetadataChecked(ActionInput input)
@@ -189,7 +199,12 @@ final class SkyframeInputMetadataProvider implements InputMetadataProvider {
     SkyValue value = lookup.tryLookup();
     seen.put(artifact.getExecPath(), artifact);
     ActionExecutionValue actionExecutionValue = (ActionExecutionValue) value;
-    return actionExecutionValue.getExistingFileArtifactValue(artifact);
+    FileArtifactValue metadata = actionExecutionValue.getExistingFileArtifactValue(artifact);
+    if (discoveredInputPathReceiver != null && metadata.isRemote()) {
+      // Include scanning reads the path before it is added to the action's checked inputs.
+      discoveredInputPathReceiver.accept(artifact.getExecPath());
+    }
+    return metadata;
   }
 
   @Nullable

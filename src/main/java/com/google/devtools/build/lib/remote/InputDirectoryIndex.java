@@ -18,24 +18,32 @@ import com.google.devtools.build.lib.actions.FilesetOutputSymlink;
 import com.google.devtools.build.lib.actions.FilesetOutputTree;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.annotation.Nullable;
 
-/** Directories and children implied by an action's checked input paths. */
+/** Directories and children implied by an action's checked and discovered input paths. */
 final class InputDirectoryIndex {
   private final ActionInputMap inputs;
   @Nullable private volatile PathFragment[] paths;
+  @Nullable private volatile ConcurrentHashMap<PathFragment, Set<PathFragment>> discoveredChildren;
 
   InputDirectoryIndex(ActionInputMap inputs) {
     this.inputs = inputs;
   }
 
-  /** Invalidates derived paths between action phases, when no filesystem operations are running. */
+  /** Invalidates checked paths between action phases, when no filesystem operations are running. */
   void clear() {
     paths = null;
   }
 
   boolean isDirectory(PathFragment execPath) {
+    var discovered = discoveredChildren;
+    if (discovered != null && discovered.containsKey(execPath)) {
+      return true;
+    }
     PathFragment[] current = paths();
     int next = upperBound(current, execPath);
     return next < current.length && current[next].startsWith(execPath);
@@ -54,7 +62,32 @@ final class InputDirectoryIndex {
         next = endOfSubtree(current, child, next);
       }
     }
-    return children;
+    var discovered = discoveredChildren;
+    Set<PathFragment> added = discovered == null ? null : discovered.get(execPath);
+    if (added == null) {
+      return children;
+    }
+    Set<PathFragment> combined = new HashSet<>(children);
+    combined.addAll(added);
+    return List.copyOf(combined);
+  }
+
+  /** Adds a path learned during input discovery without rebuilding the checked-input index. */
+  void addDiscoveredPath(PathFragment execPath) {
+    var current = discoveredChildren;
+    if (current == null) {
+      synchronized (this) {
+        current = discoveredChildren;
+        if (current == null) {
+          discoveredChildren = current = new ConcurrentHashMap<>();
+        }
+      }
+    }
+    for (PathFragment child = execPath, parent;
+        (parent = child.getParentDirectory()) != null;
+        child = parent) {
+      current.computeIfAbsent(parent, unused -> ConcurrentHashMap.newKeySet()).add(child);
+    }
   }
 
   private PathFragment[] paths() {

@@ -55,6 +55,7 @@ import com.google.devtools.build.lib.vfs.FileStatusWithDigest;
 import com.google.devtools.build.lib.vfs.FileSymlinkLoopException;
 import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.FileSystem.NotASymlinkException;
+import com.google.devtools.build.lib.vfs.OutputService.DiscoveredInputPathReceiver;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.SymlinkTargetType;
@@ -110,7 +111,7 @@ import javax.annotation.Nullable;
  * sources, such as the same path existing in multiple underlying sources with different type or
  * contents.
  */
-public class RemoteActionFileSystem extends FileSystem {
+public class RemoteActionFileSystem extends FileSystem implements DiscoveredInputPathReceiver {
   private final PathFragment execRoot;
   private final PathFragment outputBase;
   private final InputMetadataProvider inputArtifactData;
@@ -360,6 +361,11 @@ public class RemoteActionFileSystem extends FileSystem {
     this.action = action;
     // Input discovery may have added checked inputs since the previous phase.
     inputDirectories.clear();
+  }
+
+  @Override
+  public void addDiscoveredInputPath(PathFragment execPath) {
+    inputDirectories.addDiscoveredPath(execPath);
   }
 
   void injectRemoteFile(
