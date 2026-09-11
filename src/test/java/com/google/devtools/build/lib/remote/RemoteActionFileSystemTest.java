@@ -47,11 +47,13 @@ import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
 import com.google.devtools.build.lib.actions.ArtifactRoot;
 import com.google.devtools.build.lib.actions.ArtifactRoot.RootType;
+import com.google.devtools.build.lib.actions.DelegatingPairInputMetadataProvider;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
 import com.google.devtools.build.lib.actions.FilesetOutputSymlink;
 import com.google.devtools.build.lib.actions.FilesetOutputTree;
 import com.google.devtools.build.lib.actions.util.ActionsTestUtil;
 import com.google.devtools.build.lib.remote.options.RemoteOutputsMode;
+import com.google.devtools.build.lib.skyframe.ActionInputMetadataProvider;
 import com.google.devtools.build.lib.skyframe.TreeArtifactValue;
 import com.google.devtools.build.lib.testing.vfs.SpiedFileSystem;
 import com.google.devtools.build.lib.vfs.Dirent;
@@ -352,6 +354,55 @@ public final class RemoteActionFileSystemTest extends RemoteActionFileSystemTest
 
     assertThat(assertThrows(IOException.class, () -> actionFs.readdir(parent, false)))
         .isSameInstanceAs(failure);
+  }
+
+  @Test
+  public void readdir_discoveredInputsJoinCheckedChildren(
+      @TestParameter boolean checkedAfterDiscovery, @TestParameter boolean blocked)
+      throws Exception {
+    ActionInputMap checked = new ActionInputMap(1);
+    createRemoteArtifact("shared/existing", "checked", checked);
+    ActionInputMap discovered = new ActionInputMap(1);
+    Artifact header = createRemoteArtifact("shared/new/header.h", "header", discovered);
+    RemoteActionFileSystem actionFs =
+        new RemoteActionFileSystem(
+            fs,
+            execRoot.asFragment(),
+            RELATIVE_OUTPUT_PATH,
+            new DelegatingPairInputMetadataProvider(
+                new ActionInputMetadataProvider(checked),
+                new ActionInputMetadataProvider(discovered)),
+            checked,
+            ImmutableList.of(),
+            inputFetcher);
+    PathFragment shared = getOutputPath("shared");
+    PathFragment parent = shared.getChild("new");
+
+    if (blocked) {
+      fs.getPath(shared).createDirectoryAndParents();
+      FileSystemUtils.writeContent(fs.getPath(parent), UTF_8, "old output");
+      assertThat(actionFs.stat(parent, /* followSymlinks= */ true).isFile()).isTrue();
+    } else {
+      assertThat(actionFs.statIfFound(parent, /* followSymlinks= */ true)).isNull();
+      assertReaddir(
+          actionFs, shared, /* followSymlinks= */ true, new Dirent("existing", Dirent.Type.FILE));
+    }
+
+    actionFs.addDiscoveredInputPath(header.getExecPath());
+    if (checkedAfterDiscovery) {
+      checked.put(header, discovered.getInputMetadata(header));
+      actionFs.updateContext(mock(ActionExecutionMetadata.class));
+    }
+
+    assertReaddir(
+        actionFs,
+        shared,
+        /* followSymlinks= */ true,
+        new Dirent("existing", Dirent.Type.FILE),
+        new Dirent("new", Dirent.Type.DIRECTORY));
+    assertReaddir(
+        actionFs, parent, /* followSymlinks= */ true, new Dirent("header.h", Dirent.Type.FILE));
+    assertThat(actionFs.stat(header.getPath().asFragment(), true).isFile()).isTrue();
   }
 
   @Test

@@ -151,6 +151,52 @@ EOF
       || fail "Failed to build with --remote_download_minimal"
 }
 
+function test_cc_include_scanning_nested_remote_header() {
+  add_rules_cc MODULE.bazel
+  cat > header.bzl <<'EOF'
+def _generated_header_impl(ctx):
+    tree = ctx.actions.declare_directory("generated")
+    ctx.actions.run_shell(
+        outputs = [tree],
+        arguments = [tree.path],
+        command = 'mkdir -p "$1/internal" && touch "$1/internal/header.h"',
+    )
+    return DefaultInfo(files = depset([tree]))
+
+generated_header = rule(implementation = _generated_header_impl)
+EOF
+  cat > BUILD <<'EOF'
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load(":header.bzl", "generated_header")
+generated_header(name = "header")
+cc_library(name = "headers", hdrs = [":header"])
+cc_binary(
+    name = "bin",
+    srcs = ["bin.cc"],
+    deps = [":headers"],
+)
+EOF
+  cat > bin.cc <<'EOF'
+#include "generated/internal/header.h"
+int main() { return 0; }
+EOF
+  bazel build //:header \
+      --remote_executor=grpc://localhost:${worker_port} \
+      --remote_download_minimal >& "$TEST_log" \
+    || fail "Failed to build with an unmaterialized header"
+  local generated_parent="$(bazel info bazel-bin)/generated/internal"
+  [[ ! -e "$generated_parent" ]] \
+    || fail "The remote tree's nested header parent was materialized"
+
+  bazel build //:bin \
+      --experimental_unsupported_and_brittle_include_scanning \
+      --features=cc_include_scanning \
+      --remote_executor=grpc://localhost:${worker_port} \
+      --remote_download_minimal >& "$TEST_log" \
+    || fail "Failed to scan an unmaterialized generated header"
+}
+
 function test_downloads_minimal_hit_action_cache() {
   # Test that remote metadata is saved and action cache is hit across server restarts when using
   # --remote_download_minimal

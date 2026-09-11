@@ -345,6 +345,10 @@ public class ActionExecutionFunction implements SkyFunction {
                 state.compositeInputMetadataProvider,
                 state.inputArtifactData,
                 action.getOutputs());
+        if (state.actionFileSystem instanceof OutputService.DiscoveredInputPathReceiver receiver) {
+          state.skyframeInputMetadataProvider.setDiscoveredInputPathReceiver(
+              receiver::addDiscoveredInputPath);
+        }
       }
     }
 

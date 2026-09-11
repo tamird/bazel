@@ -199,6 +199,17 @@ public interface OutputService {
     return ActionFileSystemType.DISABLED;
   }
 
+  /** An action filesystem that accepts remote input paths learned during input discovery. */
+  interface DiscoveredInputPathReceiver {
+    /**
+     * Makes a successfully looked-up remote input's parent directories available for traversal.
+     *
+     * <p>The path is relative to the execution root. Calls may be concurrent and may repeat paths;
+     * the directories must be available when the method returns.
+     */
+    void addDiscoveredInputPath(PathFragment execPath);
+  }
+
   /**
    * Returns an action-scoped filesystem if {@link #actionFileSystemType} is enabled.
    *
