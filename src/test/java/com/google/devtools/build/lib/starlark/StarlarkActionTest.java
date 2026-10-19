@@ -14,6 +14,7 @@
 package com.google.devtools.build.lib.starlark;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.devtools.build.lib.actions.ActionOwner.SYSTEM_ACTION_OWNER;
 import static com.google.devtools.build.lib.actions.util.ActionsTestUtil.NULL_ACTION_OWNER;
 import static com.google.devtools.build.lib.actions.util.ActionsTestUtil.ensureMemoizedIsInitializedIsSet;
 import static com.google.devtools.build.lib.skyframe.serialization.testutils.Dumper.dumpStructureWithEquivalenceReduction;
@@ -68,6 +69,40 @@ public final class StarlarkActionTest extends BuildViewTestCase {
             (unusedInput, deserialized) ->
                 assertThat(dumpStructureWithEquivalenceReduction(deserialized))
                     .isEqualTo(originalStructure))
+        .addDependencies(getCommonSerializationDependencies())
+        .addDependencies(SerializationDepsUtils.SERIALIZATION_DEPS_FOR_TEST)
+        .runTests();
+  }
+
+  @Test
+  public void usedInputSerializationRetainsMandatoryAndCandidateInputs() throws Exception {
+    Artifact mandatory = getSourceArtifact("pkg/mandatory");
+    Artifact candidate = getSourceArtifact("pkg/candidate");
+    Artifact.DerivedArtifact output = getBinArtifactWithNoOwner("used_inputs");
+    output.setGeneratingActionKey(ActionsTestUtil.NULL_ACTION_LOOKUP_DATA);
+    StarlarkAction action =
+        (StarlarkAction)
+            new StarlarkAction.Builder()
+                .setUsedInputsList(output, NestedSetBuilder.create(Order.STABLE_ORDER, candidate))
+                .addInput(mandatory)
+                .addOutput(output)
+                .setExecutable(scratch.file("/bin/tool").asFragment())
+                .build(SYSTEM_ACTION_OWNER, targetConfig);
+    String originalStructure = dumpStructureWithEquivalenceReduction(action);
+    action.updateInputs(NestedSetBuilder.create(Order.STABLE_ORDER, mandatory));
+    assertThat(action.getAllowedDerivedInputs().toList()).containsExactly(mandatory, candidate);
+
+    new SerializationTester(action)
+        .makeMemoizingAndAllowFutureBlocking(/* allowFutureBlocking= */ true)
+        .addCodec(ArrayCodec.forComponentType(Artifact.class))
+        .setVerificationFunction(
+            (StarlarkAction unusedInput, StarlarkAction deserialized) -> {
+              assertThat(dumpStructureWithEquivalenceReduction(deserialized))
+                  .isEqualTo(originalStructure);
+              assertThat(deserialized.getMandatoryInputs().toList()).containsExactly(mandatory);
+              assertThat(deserialized.getAllowedDerivedInputs().toList())
+                  .containsExactly(mandatory, candidate);
+            })
         .addDependencies(getCommonSerializationDependencies())
         .addDependencies(SerializationDepsUtils.SERIALIZATION_DEPS_FOR_TEST)
         .runTests();

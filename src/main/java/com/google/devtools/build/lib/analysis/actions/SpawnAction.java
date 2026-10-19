@@ -422,6 +422,10 @@ public class SpawnAction extends AbstractAction implements CommandAction {
     }
   }
 
+  protected final OutputPathsMode getOutputPathsMode() {
+    return outputPathsMode;
+  }
+
   @Override
   public String describeKey() {
     StringBuilder message = new StringBuilder();
@@ -726,11 +730,11 @@ public class SpawnAction extends AbstractAction implements CommandAction {
     public SpawnAction buildForStarlarkActionTemplate(ActionOwner owner) {
       NestedSet<Artifact> tools = toolsBuilder.build();
       NestedSet<Artifact> inputs = inputsBuilder.addTransitive(tools).build();
-      return new SpawnAction(
+      return createSpawnAction(
           owner,
           tools,
           inputs,
-          outputs,
+          ImmutableSet.copyOf(outputs),
           resourceSetOrBuilder,
           buildCommandLines(),
           checkNotNull(actionEnvironment),
@@ -802,7 +806,7 @@ public class SpawnAction extends AbstractAction implements CommandAction {
         ImmutableMap<String, String> executionInfo,
         CharSequence progressMessage,
         String mnemonic) {
-      return new SpawnAction(
+      return createSpawnAction(
           owner,
           tools,
           inputsAndTools,
@@ -814,6 +818,33 @@ public class SpawnAction extends AbstractAction implements CommandAction {
           progressMessage,
           mnemonic,
           PathMappers.getOutputPathsMode(configuration));
+    }
+
+    /** Creates an action with the path mapping configuration captured by an action template. */
+    protected SpawnAction createSpawnAction(
+        ActionOwner owner,
+        NestedSet<Artifact> tools,
+        NestedSet<Artifact> inputsAndTools,
+        ImmutableSet<Artifact> outputs,
+        ResourceSetOrBuilder resourceSetOrBuilder,
+        CommandLines commandLines,
+        ActionEnvironment env,
+        ImmutableMap<String, String> executionInfo,
+        CharSequence progressMessage,
+        String mnemonic,
+        OutputPathsMode outputPathsMode) {
+      return new SpawnAction(
+          owner,
+          tools,
+          inputsAndTools,
+          outputs,
+          resourceSetOrBuilder,
+          commandLines,
+          env,
+          executionInfo,
+          progressMessage,
+          mnemonic,
+          outputPathsMode);
     }
 
     /**

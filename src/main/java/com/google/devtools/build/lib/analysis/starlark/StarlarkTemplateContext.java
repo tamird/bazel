@@ -25,9 +25,12 @@ import com.google.devtools.build.lib.actions.Artifact.SpecialArtifactType;
 import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
 import com.google.devtools.build.lib.analysis.FilesToRunProvider;
 import com.google.devtools.build.lib.analysis.actions.SpawnAction;
+import com.google.devtools.build.lib.analysis.actions.StarlarkAction;
 import com.google.devtools.build.lib.cmdline.RepositoryMapping;
 import com.google.devtools.build.lib.collect.nestedset.Depset;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
+import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
+import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.starlarkbuildapi.FileApi;
 import com.google.devtools.build.lib.starlarkbuildapi.StarlarkTemplateContextApi;
 import com.google.devtools.build.lib.supplier.InterruptibleSupplier;
@@ -78,11 +81,43 @@ public final class StarlarkTemplateContext implements StarlarkTemplateContextApi
       Object executableUnchecked,
       Object toolsUnchecked,
       Sequence<?> arguments,
-      Object progressMessage)
+      Object progressMessage,
+      Object usedInputsList,
+      Object discoveryInputs)
       throws EvalException, InterruptedException {
 
-    SpawnAction.Builder builder =
-        newSpawnActionBuilder().addOutputs(Sequence.cast(outputs, Artifact.class, "outputs"));
+    Sequence<Artifact> outputFiles = Sequence.cast(outputs, Artifact.class, "outputs");
+    SpawnAction.Builder builder;
+    if (usedInputsList == Starlark.NONE && discoveryInputs == Starlark.NONE) {
+      builder = newSpawnActionBuilder();
+    } else {
+      if (!(usedInputsList instanceof Artifact usedList) || discoveryInputs == Starlark.NONE) {
+        throw Starlark.errorf("used_inputs_list and discovery_inputs must be specified together");
+      }
+      if (usedList.isDirectory() || !outputFiles.contains(usedList)) {
+        throw Starlark.errorf("used_inputs_list must be a file in outputs");
+      }
+      NestedSet<Artifact> candidates =
+          switch (discoveryInputs) {
+            case Depset depset -> Depset.cast(depset, Artifact.class, "discovery_inputs");
+            case Sequence<?> sequence ->
+                NestedSetBuilder.wrap(
+                    Order.STABLE_ORDER,
+                    Sequence.cast(sequence, Artifact.class, "discovery_inputs"));
+            default -> throw Starlark.errorf("discovery_inputs must be a list or depset of Files");
+          };
+      for (Artifact candidate : candidates.toList()) {
+        if (candidate.isDirectory()) {
+          throw Starlark.errorf(
+              "discovery_inputs must contain individual files, not directory %s;"
+                  + " pass its expanded children instead",
+              candidate);
+        }
+      }
+      builder =
+          new StarlarkAction.Builder(spawnActionBuilder).setUsedInputsList(usedList, candidates);
+    }
+    builder.addOutputs(outputFiles);
 
     // The only other type is NoneType, which if specified will use the default progress message of
     // an action.
