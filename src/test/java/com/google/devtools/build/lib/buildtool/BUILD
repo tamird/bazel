@@ -609,6 +609,7 @@ java_test(
         "//third_party/java/guava:collect",
         "//third_party/java/junit",
         "//third_party/java/protobuf",
+        "//third_party/java/protobuf/util:json",
         "//third_party/java/truth",
     ],
 )
