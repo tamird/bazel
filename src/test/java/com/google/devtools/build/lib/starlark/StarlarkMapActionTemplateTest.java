@@ -1444,6 +1444,245 @@ public final class StarlarkMapActionTemplateTest extends BuildIntegrationTestCas
                 + ".*test/target_output_dir/subdir1.*");
   }
 
+  private void writeDiscoveryRule() throws Exception {
+    write(
+        "discovery/rule.bzl",
+        """
+        def expand(template_ctx, input_directories, output_directories, additional_inputs,
+                   tools, additional_params):
+            candidates = (input_directories["headers"].children if additional_params["generated"]
+                          else [v for k, v in additional_inputs.items() if k.startswith("candidate")])
+            for seed in input_directories["seed"].children:
+                output = template_ctx.declare_file(seed.basename, directory = output_directories["out"])
+                used = template_ctx.declare_file(seed.basename + ".used", directory = output_directories["out"])
+                selected = [f for f in candidates if f.basename == seed.basename + ".h"][0]
+                args = template_ctx.args()
+                args.add_all([output, used, selected])
+                args.add(additional_params["mode"])
+                if additional_params["mode"] == "mandatory":
+                    args.add(additional_inputs["mandatory0"])
+                template_ctx.run(
+                    outputs = [output, used],
+                    inputs = [v for k, v in additional_inputs.items() if k.startswith("mandatory")],
+                    discovery_inputs = depset(candidates),
+                    used_inputs_list = used,
+                    executable = tools["scanner"],
+                    arguments = [args],
+                )
+
+        def impl(ctx):
+            seed = ctx.actions.declare_directory(ctx.label.name + "_seed")
+            headers = ctx.actions.declare_directory(ctx.label.name + "_headers")
+            out = ctx.actions.declare_directory(ctx.label.name + "_out")
+            ctx.actions.run_shell(
+                outputs = [seed],
+                command = "touch %s/a %s/b" % (seed.path, seed.path),
+            )
+            args = ctx.actions.args()
+            args.add(headers.path)
+            args.add_all(ctx.files.candidates)
+            ctx.actions.run_shell(
+                inputs = ctx.files.candidates,
+                outputs = [headers],
+                arguments = [args],
+                command = 'dest="$1"; shift; cp "$@" "$dest/"',
+            )
+            scanner = ctx.actions.declare_file(ctx.label.name + "_scanner")
+            ctx.actions.write(scanner, '''#!/bin/bash
+        echo RUN:"$(basename "$1")" >&2
+        case "$4" in
+          empty) echo constant > "$1"; : > "$2" ;;
+          unknown) echo constant > "$1"; echo undeclared.h > "$2" ;;
+          missing) echo constant > "$1" ;;
+          mandatory) cat "$3" > "$1"; printf '%s\\n' "$3" "$5" > "$2" ;;
+          *) cat "$3" > "$1"; printf '%s\\n' "$3" > "$2" ;;
+        esac
+        ''', is_executable = True)
+            extra = {"candidate%d" % i: f for i, f in enumerate(ctx.files.candidates)}
+            extra.update({"mandatory%d" % i: f for i, f in enumerate(ctx.files.mandatory)})
+            ctx.actions.map_directory(
+                input_directories = {"seed": seed, "headers": headers},
+                output_directories = {"out": out},
+                additional_inputs = extra,
+                additional_params = {"generated": ctx.attr.generated, "mode": ctx.attr.mode},
+                tools = {"scanner": scanner},
+                mnemonic = "DiscoverInputs",
+                execution_requirements = {"supports-path-mapping": "1"},
+                implementation = expand,
+            )
+            return [DefaultInfo(files = depset([out]))]
+
+        discovery = rule(implementation = impl, attrs = {
+            "candidates": attr.label_list(allow_files = True),
+            "mandatory": attr.label_list(allow_files = True),
+            "generated": attr.bool(),
+            "mode": attr.string(default = "normal"),
+        })
+        """);
+    write("discovery/a.h", "first");
+    write("discovery/b.h", "second");
+    write("discovery/namespace", "original search order");
+  }
+
+  private void writeDiscoveryTarget(
+      boolean generated, String mode, String candidates, String mandatory) throws Exception {
+    write(
+        "discovery/BUILD",
+        "load(':rule.bzl', 'discovery')",
+        "discovery(name = 'target', candidates = "
+            + candidates
+            + ", mandatory = "
+            + mandatory
+            + ", generated = "
+            + (generated ? "True" : "False")
+            + ", mode = '"
+            + mode
+            + "')");
+  }
+
+  private String buildDiscoveryTarget() throws Exception {
+    RecordingOutErr recording = new RecordingOutErr();
+    outErr = recording;
+    try {
+      buildTarget("//discovery:target");
+    } catch (ViewCreationFailedException | BuildFailedException e) {
+      throw new AssertionError(recording.errAsLatin1(), e);
+    }
+    return recording.errAsLatin1();
+  }
+
+  @Test
+  public void usedInputsPruneOnlyUnusedCandidates(
+      @TestParameter boolean generated, @TestParameter boolean strip) throws Exception {
+    if (strip) {
+      addOptions("--experimental_output_paths=strip");
+    }
+    writeDiscoveryRule();
+    writeDiscoveryTarget(generated, "normal", "['a.h', 'b.h']", "['namespace']");
+    assertThat(buildDiscoveryTarget()).contains("RUN:a");
+    assertThat(buildDiscoveryTarget()).doesNotContain("RUN:");
+    getSkyframeExecutor().resetEvaluator();
+    assertThat(buildDiscoveryTarget()).doesNotContain("RUN:");
+
+    write("discovery/a.h", "changed first");
+    String firstChanged = buildDiscoveryTarget();
+    assertThat(firstChanged).contains("RUN:a");
+    assertThat(firstChanged).doesNotContain("RUN:b");
+    SpecialArtifact out = assertTreeBuilt("//discovery:target", "discovery/target_out");
+    assertTreeContainsFileWithContents(out, "a", "changed first");
+    assertTreeContainsFileWithContents(out, "b", "second");
+
+    write("discovery/b.h", "changed second");
+    String secondChanged = buildDiscoveryTarget();
+    assertThat(secondChanged).contains("RUN:b");
+    assertThat(secondChanged).doesNotContain("RUN:a");
+
+    write("discovery/namespace", "changed search order");
+    String namespaceChanged = buildDiscoveryTarget();
+    assertThat(namespaceChanged).contains("RUN:a");
+    assertThat(namespaceChanged).contains("RUN:b");
+  }
+
+  @Test
+  public void usedInputMembershipChangesInvalidatePrunedCache() throws Exception {
+    writeDiscoveryRule();
+    writeDiscoveryTarget(false, "normal", "['a.h', 'b.h']", "['namespace']");
+    buildDiscoveryTarget();
+
+    write("discovery/new_mandatory", "new specification");
+    writeDiscoveryTarget(false, "normal", "['a.h', 'b.h']", "['namespace', 'new_mandatory']");
+    String mandatoryAdded = buildDiscoveryTarget();
+    assertThat(mandatoryAdded).contains("RUN:a");
+    assertThat(mandatoryAdded).contains("RUN:b");
+
+    write("discovery/shadow.h", "new candidate");
+    writeDiscoveryTarget(
+        false, "normal", "['a.h', 'b.h', 'shadow.h']", "['namespace', 'new_mandatory']");
+    String candidateAdded = buildDiscoveryTarget();
+    assertThat(candidateAdded).contains("RUN:a");
+    assertThat(candidateAdded).contains("RUN:b");
+    assertThat(buildDiscoveryTarget()).doesNotContain("RUN:");
+    writeDiscoveryTarget(false, "normal", "['a.h', 'b.h']", "['namespace', 'new_mandatory']");
+    String candidateRemoved = buildDiscoveryTarget();
+    assertThat(candidateRemoved).contains("RUN:a");
+    assertThat(candidateRemoved).contains("RUN:b");
+  }
+
+  @Test
+  public void emptyUsedInputListRetainsMandatoryInputs() throws Exception {
+    writeDiscoveryRule();
+    writeDiscoveryTarget(false, "empty", "['a.h', 'b.h']", "['namespace']");
+    buildDiscoveryTarget();
+    write("discovery/a.h", "unused change");
+    assertThat(buildDiscoveryTarget()).doesNotContain("RUN:");
+    write("discovery/namespace", "mandatory change");
+    assertThat(buildDiscoveryTarget()).contains("RUN:");
+    String rule =
+        new String(
+            FileSystemUtils.readContentAsLatin1(
+                directories.getWorkspace().getRelative("discovery/rule.bzl")));
+    write("discovery/rule.bzl", rule.replace("echo RUN:", "echo TOOL_CHANGED:"));
+    assertThat(buildDiscoveryTarget()).contains("TOOL_CHANGED:");
+  }
+
+  @Test
+  public void usedInputsMayNameMandatoryFiles() throws Exception {
+    writeDiscoveryRule();
+    writeDiscoveryTarget(false, "mandatory", "['a.h', 'b.h']", "['namespace']");
+    assertThat(buildDiscoveryTarget()).contains("RUN:");
+    assertThat(buildDiscoveryTarget()).doesNotContain("RUN:");
+  }
+
+  @Test
+  public void invalidDiscoveryArgumentsFail(
+      @TestParameter({"missingUsed", "missingCandidates", "directory", "notOutput"}) String invalid)
+      throws Exception {
+    writeDiscoveryRule();
+    writeDiscoveryTarget(false, "normal", "['a.h', 'b.h']", "[]");
+    String rule =
+        new String(
+            FileSystemUtils.readContentAsLatin1(
+                directories.getWorkspace().getRelative("discovery/rule.bzl")));
+    String expected;
+    switch (invalid) {
+      case "missingUsed" -> {
+        rule = rule.replace("used_inputs_list = used", "used_inputs_list = None");
+        expected = "must be specified together";
+      }
+      case "missingCandidates" -> {
+        rule = rule.replace("discovery_inputs = depset(candidates)", "discovery_inputs = None");
+        expected = "must be specified together";
+      }
+      case "directory" -> {
+        rule = rule.replace("depset(candidates)", "[input_directories['headers'].directory]");
+        expected = "must contain individual files";
+      }
+      case "notOutput" -> {
+        rule = rule.replace("outputs = [output, used]", "outputs = [output]");
+        expected = "used_inputs_list must be a file in outputs";
+      }
+      default -> throw new AssertionError(invalid);
+    }
+    write("discovery/rule.bzl", rule);
+    RecordingOutErr recording = new RecordingOutErr();
+    outErr = recording;
+    assertThrows(BuildFailedException.class, () -> buildTarget("//discovery:target"));
+    assertThat(recording.errAsLatin1()).contains(expected);
+  }
+
+  @Test
+  public void invalidUsedInputsFail(@TestParameter({"unknown", "missing"}) String mode)
+      throws Exception {
+    writeDiscoveryRule();
+    writeDiscoveryTarget(false, mode, "['a.h', 'b.h']", "[]");
+    RecordingOutErr recording = new RecordingOutErr();
+    outErr = recording;
+    assertThrows(BuildFailedException.class, () -> buildTarget("//discovery:target"));
+    assertThat(recording.errAsLatin1())
+        .contains(
+            mode.equals("unknown") ? "undeclared input: undeclared.h" : "listing used inputs");
+  }
+
   private SpecialArtifact assertTreeBuilt(String rootRelativePath) throws Exception {
     return assertTreeBuilt("//test:target", rootRelativePath);
   }

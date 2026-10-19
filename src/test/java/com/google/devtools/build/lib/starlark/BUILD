@@ -427,6 +427,7 @@ java_test(
     name = "StarlarkActionTest",
     srcs = ["StarlarkActionTest.java"],
     deps = [
+        "//src/main/java/com/google/devtools/build/lib/actions:action_input_prefetcher",
         "//src/main/java/com/google/devtools/build/lib/actions:artifacts",
         "//src/main/java/com/google/devtools/build/lib/analysis:analysis_core",
         "//src/main/java/com/google/devtools/build/lib/collect/nestedset",

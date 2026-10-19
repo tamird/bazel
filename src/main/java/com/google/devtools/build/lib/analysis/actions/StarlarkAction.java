@@ -13,6 +13,7 @@
 // limitations under the License.
 package com.google.devtools.build.lib.analysis.actions;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -26,19 +27,21 @@ import com.google.devtools.build.lib.actions.Action;
 import com.google.devtools.build.lib.actions.ActionEnvironment;
 import com.google.devtools.build.lib.actions.ActionExecutionContext;
 import com.google.devtools.build.lib.actions.ActionExecutionException;
+import com.google.devtools.build.lib.actions.ActionKeyContext;
 import com.google.devtools.build.lib.actions.ActionOwner;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.CommandLineExpansionException;
+import com.google.devtools.build.lib.actions.CommandLineItem.ExceptionlessMapFn;
 import com.google.devtools.build.lib.actions.CommandLines;
 import com.google.devtools.build.lib.actions.EnvironmentalExecException;
 import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.ExecutionRequirements;
+import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.actions.PathMapper;
 import com.google.devtools.build.lib.actions.ResourceSetOrBuilder;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.actions.UserExecException;
-import com.google.devtools.build.lib.analysis.config.BuildConfigurationValue;
 import com.google.devtools.build.lib.analysis.config.CoreOptions.OutputPathsMode;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
@@ -48,6 +51,7 @@ import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.server.FailureDetails.StarlarkAction.Code;
 import com.google.devtools.build.lib.skyframe.serialization.VisibleForSerialization;
 import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec;
+import com.google.devtools.build.lib.util.Fingerprint;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.ByteString;
 import java.io.BufferedReader;
@@ -55,9 +59,11 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import javax.annotation.Nullable;
 
 /** A Starlark specific SpawnAction. */
@@ -148,8 +154,23 @@ public class StarlarkAction extends SpawnAction {
   public static class Builder extends SpawnAction.Builder {
 
     private Optional<Artifact> unusedInputsList = Optional.empty();
+    private Optional<Artifact> usedInputsList = Optional.empty();
+    private NestedSet<Artifact> discoveryInputs = NestedSetBuilder.emptySet(Order.STABLE_ORDER);
     private Optional<Action> shadowedAction = Optional.empty();
     @Nullable private Artifact stdoutOutput = null;
+
+    public Builder() {}
+
+    public Builder(SpawnAction.Builder other) {
+      super(other);
+    }
+
+    @CanIgnoreReturnValue
+    public Builder setUsedInputsList(Artifact usedInputsList, NestedSet<Artifact> discoveryInputs) {
+      this.usedInputsList = Optional.of(usedInputsList);
+      this.discoveryInputs = discoveryInputs;
+      return this;
+    }
 
     @CanIgnoreReturnValue
     public Builder setUnusedInputsList(Optional<Artifact> unusedInputsList) {
@@ -183,22 +204,27 @@ public class StarlarkAction extends SpawnAction {
         ResourceSetOrBuilder resourceSetOrBuilder,
         CommandLines commandLines,
         ActionEnvironment env,
-        @Nullable BuildConfigurationValue configuration,
         ImmutableMap<String, String> executionInfo,
         CharSequence progressMessage,
-        String mnemonic) {
-      if (unusedInputsList.isPresent()) {
-        // Always download unused_inputs_list file from remote cache.
+        String mnemonic,
+        OutputPathsMode outputPathsMode) {
+      checkArgument(
+          usedInputsList.isEmpty() || (unusedInputsList.isEmpty() && shadowedAction.isEmpty()));
+      Optional<Artifact> inputList = usedInputsList.or(() -> unusedInputsList);
+      if (inputList.isPresent()) {
+        // Always download the input list from remote execution/cache.
         executionInfo =
             ImmutableMap.<String, String>builderWithExpectedSize(executionInfo.size() + 1)
                 .putAll(executionInfo)
                 .put(
                     ExecutionRequirements.REMOTE_EXECUTION_INLINE_OUTPUTS,
-                    unusedInputsList.get().getExecPathString())
+                    inputList.get().getExecPathString())
                 .buildOrThrow();
       }
-      OutputPathsMode outputPathsMode = PathMappers.getOutputPathsMode(configuration);
-      return unusedInputsList.isPresent() || shadowedAction.isPresent() || stdoutOutput != null
+      return unusedInputsList.isPresent()
+              || usedInputsList.isPresent()
+              || shadowedAction.isPresent()
+              || stdoutOutput != null
           ? new EnhancedStarlarkAction(
               owner,
               tools,
@@ -212,6 +238,8 @@ public class StarlarkAction extends SpawnAction {
               mnemonic,
               outputPathsMode,
               unusedInputsList,
+              usedInputsList,
+              discoveryInputs,
               shadowedAction,
               stdoutOutput)
           : new StarlarkAction(
@@ -230,22 +258,24 @@ public class StarlarkAction extends SpawnAction {
   }
 
   /**
-   * A {@link StarlarkAction} with {@code unused_inputs_list}, a shadowed action, and/or a {@code
-   * stdout} output present.
+   * A {@link StarlarkAction} with an input list, a shadowed action, and/or a {@code stdout} output
+   * present.
    */
   @AutoCodec
   @VisibleForSerialization
   static final class EnhancedStarlarkAction extends StarlarkAction {
-    // All the inputs of the Starlark action including those listed in the unused inputs and
-    // excluding the shadowed action inputs.
+    // The ordinary inputs (including tools). In used-list mode these are mandatory; discovery
+    // candidates and shadowed-action inputs are stored separately.
     private final NestedSet<Artifact> allStarlarkActionInputs;
-    // allStarlarkActionInputs plus shadowed action inputs, if present.
+    // allStarlarkActionInputs plus discovery candidates or shadowed inputs, if present.
     private final NestedSet<Artifact> originalInputs;
 
-    // Null when there is no shadowed action.
+    // Null when there is neither a used-input list nor a shadowed action.
     @Nullable private final NestedSet<Artifact> mandatoryInputs;
 
     private final Optional<Artifact> unusedInputsList;
+    private final Optional<Artifact> usedInputsList;
+    private final NestedSet<Artifact> discoveryInputs;
     private final Optional<Action> shadowedAction;
     @Nullable private final Artifact stdoutOutput;
     private boolean inputsDiscovered = false;
@@ -264,6 +294,8 @@ public class StarlarkAction extends SpawnAction {
         String mnemonic,
         OutputPathsMode outputPathsMode,
         Optional<Artifact> unusedInputsList,
+        Optional<Artifact> usedInputsList,
+        NestedSet<Artifact> discoveryInputs,
         Optional<Action> shadowedAction,
         @Nullable Artifact stdoutOutput) {
       super(
@@ -271,7 +303,7 @@ public class StarlarkAction extends SpawnAction {
           tools,
           shadowedAction.isPresent()
               ? createInputs(shadowedAction.get().getInputs(), inputs)
-              : inputs,
+              : createInputs(inputs, discoveryInputs),
           outputs,
           resourceSetOrBuilder,
           commandLines,
@@ -285,8 +317,10 @@ public class StarlarkAction extends SpawnAction {
       this.mandatoryInputs =
           shadowedAction.isPresent()
               ? createInputs(shadowedAction.get().getMandatoryInputs(), inputs)
-              : null;
+              : usedInputsList.isPresent() ? inputs : null;
       this.unusedInputsList = unusedInputsList;
+      this.usedInputsList = usedInputsList;
+      this.discoveryInputs = discoveryInputs;
       this.shadowedAction = shadowedAction;
       this.stdoutOutput = stdoutOutput;
     }
@@ -306,6 +340,8 @@ public class StarlarkAction extends SpawnAction {
         String mnemonic,
         OutputPathsMode outputPathsMode,
         Optional<Artifact> unusedInputsList,
+        Optional<Artifact> usedInputsList,
+        NestedSet<Artifact> discoveryInputs,
         Optional<Action> shadowedAction,
         @Nullable Artifact stdoutOutput) {
       super(
@@ -313,7 +349,7 @@ public class StarlarkAction extends SpawnAction {
           tools,
           shadowedAction.isPresent()
               ? createInputs(shadowedAction.get().getInputs(), allStarlarkActionInputs)
-              : allStarlarkActionInputs,
+              : createInputs(allStarlarkActionInputs, discoveryInputs),
           rawOutputs,
           resourceSetOrBuilder,
           commandLines,
@@ -327,8 +363,10 @@ public class StarlarkAction extends SpawnAction {
       this.mandatoryInputs =
           shadowedAction.isPresent()
               ? createInputs(shadowedAction.get().getMandatoryInputs(), allStarlarkActionInputs)
-              : null;
+              : usedInputsList.isPresent() ? allStarlarkActionInputs : null;
       this.unusedInputsList = unusedInputsList;
+      this.usedInputsList = usedInputsList;
+      this.discoveryInputs = discoveryInputs;
       this.shadowedAction = shadowedAction;
       this.stdoutOutput = stdoutOutput;
     }
@@ -353,12 +391,13 @@ public class StarlarkAction extends SpawnAction {
 
     @Override
     public boolean isShareable() {
-      return unusedInputsList.isEmpty();
+      return unusedInputsList.isEmpty() && usedInputsList.isEmpty();
     }
 
     @Override
     public boolean discoversInputs() {
       return unusedInputsList.isPresent()
+          || usedInputsList.isPresent()
           || (shadowedAction.isPresent() && shadowedAction.get().discoversInputs());
     }
 
@@ -389,6 +428,9 @@ public class StarlarkAction extends SpawnAction {
 
     @Override
     public NestedSet<Artifact> getAllowedDerivedInputs() {
+      if (usedInputsList.isPresent()) {
+        return originalInputs;
+      }
       if (shadowedAction.isPresent()) {
         return createInputs(shadowedAction.get().getAllowedDerivedInputs(), getInputs());
       }
@@ -418,34 +460,42 @@ public class StarlarkAction extends SpawnAction {
       }
       // Otherwise, we need to "re-discover" all the original inputs: the unused ones that were
       // removed might now be needed.
-      updateInputs(allStarlarkActionInputs);
-      return allStarlarkActionInputs;
+      NestedSet<Artifact> inputs =
+          usedInputsList.isPresent() ? originalInputs : allStarlarkActionInputs;
+      updateInputs(inputs);
+      return inputs;
     }
 
-    private InputStream getUnusedInputListInputStream(
-        ActionExecutionContext actionExecutionContext, List<SpawnResult> spawnResults)
+    private InputStream getInputListInputStream(
+        Artifact inputList,
+        ActionExecutionContext actionExecutionContext,
+        List<SpawnResult> spawnResults)
         throws IOException, ExecException {
 
       // Check if the file is in-memory.
       // Note: SpawnActionContext guarantees that the first list entry exists and corresponds to the
       // executed spawn.
-      Artifact unusedInputsListArtifact = unusedInputsList.get();
-      ByteString content = spawnResults.get(0).getInMemoryOutput(unusedInputsListArtifact);
+      ByteString content = spawnResults.get(0).getInMemoryOutput(inputList);
       if (content != null) {
         return content.newInput();
       }
       // Fallback to reading from disk.
       try {
-        return actionExecutionContext
-            .getPathResolver()
-            .toPath(unusedInputsListArtifact)
-            .getInputStream();
+        return actionExecutionContext.getPathResolver().toPath(inputList).getInputStream();
       } catch (FileNotFoundException e) {
+        boolean used = usedInputsList.isPresent();
         String message =
-            "Action did not create expected output file listing unused inputs: "
-                + unusedInputsListArtifact.getExecPathString();
+            "Action did not create expected output file listing "
+                + (used ? "used" : "unused")
+                + " inputs: "
+                + inputList.getExecPathString();
         throw new UserExecException(
-            e, createFailureDetail(message, Code.UNUSED_INPUT_LIST_FILE_NOT_FOUND));
+            e,
+            createFailureDetail(
+                message,
+                used
+                    ? Code.USED_INPUT_LIST_FILE_NOT_FOUND
+                    : Code.UNUSED_INPUT_LIST_FILE_NOT_FOUND));
       }
     }
 
@@ -455,6 +505,10 @@ public class StarlarkAction extends SpawnAction {
         List<SpawnResult> spawnResults,
         PathMapper pathMapper)
         throws ExecException {
+      if (usedInputsList.isPresent()) {
+        pruneDiscoveryInputs(actionExecutionContext, spawnResults, pathMapper);
+        return;
+      }
       if (unusedInputsList.isEmpty()) {
         return;
       }
@@ -469,7 +523,8 @@ public class StarlarkAction extends SpawnAction {
       try (BufferedReader br =
           new BufferedReader(
               new InputStreamReader(
-                  getUnusedInputListInputStream(actionExecutionContext, spawnResults),
+                  getInputListInputStream(
+                      unusedInputsList.get(), actionExecutionContext, spawnResults),
                   ISO_8859_1))) {
         String line;
         while ((line = br.readLine()) != null) {
@@ -501,6 +556,99 @@ public class StarlarkAction extends SpawnAction {
       }
     }
 
+    private void pruneDiscoveryInputs(
+        ActionExecutionContext actionExecutionContext,
+        List<SpawnResult> spawnResults,
+        PathMapper pathMapper)
+        throws ExecException {
+      Set<String> usedPaths = new HashSet<>();
+      try (BufferedReader reader =
+          new BufferedReader(
+              new InputStreamReader(
+                  getInputListInputStream(
+                      usedInputsList.get(), actionExecutionContext, spawnResults),
+                  ISO_8859_1))) {
+        String line;
+        while ((line = reader.readLine()) != null) {
+          if (!line.isEmpty()) {
+            usedPaths.add(line);
+          }
+        }
+      } catch (IOException e) {
+        throw new EnvironmentalExecException(
+            e, createFailureDetail("Used inputs read failure", Code.USED_INPUT_LIST_READ_FAILURE));
+      }
+
+      // Keep only O(used inputs) path strings, rather than building a map of every candidate.
+      // Do not consume usedPaths while walking: path mapping can give multiple inputs the same
+      // path.
+      Set<String> unmatchedPaths = new HashSet<>(usedPaths);
+      NestedSetBuilder<Artifact> retained =
+          NestedSetBuilder.<Artifact>stableOrder().addTransitive(mandatoryInputs);
+      for (Artifact input : mandatoryInputs.toList()) {
+        unmatchedPaths.remove(pathMapper.getMappedExecPathString(input));
+      }
+      boolean pruned = false;
+      for (Artifact input : discoveryInputs.toList()) {
+        String path = pathMapper.getMappedExecPathString(input);
+        if (usedPaths.contains(path)) {
+          retained.add(input);
+          unmatchedPaths.remove(path);
+        } else {
+          pruned = true;
+        }
+      }
+      if (!unmatchedPaths.isEmpty()) {
+        throw new UserExecException(
+            createFailureDetail(
+                "Used inputs list contains an undeclared input: "
+                    + unmatchedPaths.iterator().next(),
+                Code.USED_INPUT_LIST_UNDECLARED_INPUT));
+      }
+      prunedInputs = pruned;
+      updateInputs(retained.build());
+    }
+
+    private static final ExceptionlessMapFn<Artifact> INPUT_PATH =
+        (input, consumer) -> {
+          consumer.accept(input.isSourceArtifact() ? "source" : "derived");
+          consumer.accept(input.getExecPathString());
+        };
+
+    private static final ExceptionlessMapFn<Artifact> MAPPED_INPUT_PATH =
+        (input, consumer) -> {
+          consumer.accept(input.isSourceArtifact() ? "source" : "derived");
+          consumer.accept(
+              PathMapper.forActionKey(OutputPathsMode.STRIP).getMappedExecPathString(input));
+        };
+
+    @Override
+    protected void computeKey(
+        ActionKeyContext actionKeyContext,
+        @Nullable InputMetadataProvider inputMetadataProvider,
+        Fingerprint fp)
+        throws CommandLineExpansionException, InterruptedException {
+      super.computeKey(actionKeyContext, inputMetadataProvider, fp);
+      if (usedInputsList.isEmpty()) {
+        return;
+      }
+      OutputPathsMode mode =
+          PathMappers.getEffectiveOutputPathsMode(
+              getOutputPathsMode(), getMnemonic(), getExecutionInfo());
+      ExceptionlessMapFn<Artifact> pathFn =
+          mode == OutputPathsMode.OFF ? INPUT_PATH : MAPPED_INPUT_PATH;
+      fp.addString("used_inputs_list");
+      fp.addString(PathMapper.forActionKey(mode).getMappedExecPathString(usedInputsList.get()));
+      // A pruned cache entry restores only its recorded inputs. Membership changes must invalidate
+      // it too, including a new mandatory input or a newly available header that shadows an old
+      // one.
+      // Reuse nested-set fingerprints across children sharing a large candidate namespace.
+      fp.addString("mandatory_inputs");
+      actionKeyContext.addNestedSetToFingerprint(pathFn, fp, mandatoryInputs);
+      fp.addString("discovery_inputs");
+      actionKeyContext.addNestedSetToFingerprint(pathFn, fp, discoveryInputs);
+    }
+
     @Override
     Spawn getSpawnForExtraActionSpawnInfo()
         throws CommandLineExpansionException, InterruptedException {
@@ -508,7 +656,7 @@ public class StarlarkAction extends SpawnAction {
         return this.getSpawnForExtraActionSpawnInfo(
             createInputs(shadowedAction.get().getInputs(), allStarlarkActionInputs));
       }
-      return this.getSpawnForExtraActionSpawnInfo(allStarlarkActionInputs);
+      return this.getSpawnForExtraActionSpawnInfo(originalInputs);
     }
 
     @Nullable
@@ -517,7 +665,7 @@ public class StarlarkAction extends SpawnAction {
         ActionExecutionContext actionExecutionContext)
         throws ActionExecutionException, InterruptedException {
       if (shadowedAction.isEmpty()) {
-        return allStarlarkActionInputs;
+        return originalInputs;
       }
       NestedSet<Artifact> inputFilesForExtraAction =
           shadowedAction.get().getInputFilesForExtraAction(actionExecutionContext);

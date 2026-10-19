@@ -142,6 +142,48 @@ public interface StarlarkTemplateContextApi extends StarlarkValue {
             positional = false,
             defaultValue = "None",
             doc = "Progress message to show to the user during the build."),
+        @Param(
+            name = "used_inputs_list",
+            allowedTypes = {
+              @ParamType(type = FileApi.class),
+              @ParamType(type = NoneType.class),
+            },
+            named = true,
+            positional = false,
+            defaultValue = "None",
+            doc =
+                "An output file listing the files from <code>discovery_inputs</code> that the"
+                    + " action used, one execution-root-relative path per line. Paths must use the"
+                    + " action's path mapping, if enabled. The file must be declared in"
+                    + " <code>outputs</code> and produced even when empty. A missing file or a path"
+                    + " not declared in the action's inputs is an error. Exact paths of mandatory"
+                    + " Files are accepted; those inputs are always retained. Children of mandatory"
+                    + " directory artifacts must be omitted from the list: the directory is"
+                    + " retained in full. After execution, changes"
+                    + " to unlisted discovery inputs do not invalidate the cached action. An empty"
+                    + " file retains only mandatory inputs and tools. Must be specified together"
+                    + " with <code>discovery_inputs</code>."),
+        @Param(
+            name = "discovery_inputs",
+            allowedTypes = {
+              @ParamType(type = Sequence.class, generic1 = FileApi.class),
+              @ParamType(type = Depset.class),
+              @ParamType(type = NoneType.class),
+            },
+            named = true,
+            positional = false,
+            defaultValue = "None",
+            doc =
+                "List or depset of candidate input Files, in addition to the mandatory"
+                    + " <code>inputs</code> and <code>tools</code>. All candidates are available"
+                    + " when the action executes. Directory artifacts are not supported: use"
+                    + " individual files from an expanded input directory. Adding or removing a"
+                    + " candidate invalidates the action, even if it was not previously used."
+                    + " The action must report every candidate that can affect its outputs in"
+                    + " <code>used_inputs_list</code>. Search order, namespace membership, and"
+                    + " other information needed to detect newly shadowing inputs must remain"
+                    + " mandatory inputs or arguments. Cached discovery is an optimization, not"
+                    + " a guarantee that a fresh client avoids reading all candidate inputs."),
       })
   void run(
       Sequence<?> outputs,
@@ -149,6 +191,8 @@ public interface StarlarkTemplateContextApi extends StarlarkValue {
       Object executableUnchecked,
       Object toolsUnchecked,
       Sequence<?> arguments,
-      Object progressMessage)
+      Object progressMessage,
+      Object usedInputsList,
+      Object discoveryInputs)
       throws EvalException, InterruptedException;
 }
