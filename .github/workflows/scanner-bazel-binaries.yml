@@ -1,9 +1,12 @@
 name: Scanner Bazel binaries
 
 on:
-  push:
-    branches: [codex/scanner-bazel-binaries]
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: JSON array of native platforms to build
+        type: string
+        default: '["linux-x86_64", "linux-arm64", "darwin-arm64", "darwin-x86_64"]'
 
 permissions:
   contents: read
@@ -16,18 +19,12 @@ jobs:
   native:
     if: github.repository == 'tamird/bazel'
     name: ${{ matrix.platform }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-24.04","linux-arm64":"ubuntu-24.04-arm","darwin-arm64":"macos-15","darwin-x86_64":"macos-15-intel"}')[matrix.platform] }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-          - platform: darwin-arm64
-            runner: macos-15
+        platform: ${{ fromJSON(inputs.platforms) }}
     env:
       SOURCE_COMMIT: 702b0be17db83ef281bb87e97e6921a50a6ebb73
       BAZEL_VERSION: 10.0.0-702b0be17d
