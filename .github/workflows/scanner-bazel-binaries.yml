@@ -29,14 +29,14 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
     env:
-      SOURCE_COMMIT: c2d2b7f008e75a217d8fcf1d80d0ca64fe09cc94
-      BAZEL_VERSION: 10.0.0-c2d2b7f008
-      USE_BAZEL_VERSION: 9.3.0
+      SOURCE_COMMIT: 702b0be17db83ef281bb87e97e6921a50a6ebb73
+      BAZEL_VERSION: 10.0.0-702b0be17d
+      USE_BAZEL_VERSION: 9.3.1
       BINARY_PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: c2d2b7f008e75a217d8fcf1d80d0ca64fe09cc94
+          ref: 702b0be17db83ef281bb87e97e6921a50a6ebb73
           persist-credentials: false
 
       - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
@@ -83,6 +83,7 @@ jobs:
             //src/test/java/com/google/devtools/build/lib/starlark:StarlarkActionTest \
             //src/test/java/com/google/devtools/build/lib/starlark:StarlarkActionWithShadowedActionTest \
             //src/test/java/com/google/devtools/build/lib/buildtool:AqueryBuildToolTest \
+            //src/test/java/com/google/devtools/build/lib/sandbox:SmallTests \
             2>&1 | tee "$RUNNER_TEMP/scanner-bazel/tests.log"
 
       - name: Verify packaged native runtime and record artifact
@@ -145,5 +146,6 @@ jobs:
             bazel-testlogs/src/test/java/com/google/devtools/build/lib/starlark/StarlarkActionTest/test.*
             bazel-testlogs/src/test/java/com/google/devtools/build/lib/starlark/StarlarkActionWithShadowedActionTest/test.*
             bazel-testlogs/src/test/java/com/google/devtools/build/lib/buildtool/AqueryBuildToolTest/test.*
+            bazel-testlogs/src/test/java/com/google/devtools/build/lib/sandbox/SmallTests/test.*
           if-no-files-found: error
           retention-days: 14
