@@ -292,9 +292,15 @@ public interface OutputService {
 
     /**
      * Guards an action from the beginning to the end of its {@link Action#discoverInputs input
-     * discovery}, during which it may read any of its inputs and scheduling dependencies.
+     * discovery}, during which it may read the evaluated inputs and its scheduling dependencies.
+     *
+     * <p>The evaluated inputs include inputs restored from the action cache, but may exclude inputs
+     * previously pruned by the action. Those pruned inputs may have been restored in {@link
+     * Action#getInputs} without being evaluated yet. Newly discovered inputs are evaluated before
+     * execution and protected by {@link #enterActionExecution}.
      */
-    SilentCloseable enterInputDiscovery(Action action, InputMetadataProvider metadataProvider)
+    SilentCloseable enterInputDiscovery(
+        Action action, Iterable<Artifact> evaluatedInputs, InputMetadataProvider metadataProvider)
         throws InterruptedException;
 
     /**
@@ -316,7 +322,9 @@ public interface OutputService {
 
           @Override
           public SilentCloseable enterInputDiscovery(
-              Action action, InputMetadataProvider metadataProvider) {
+              Action action,
+              Iterable<Artifact> evaluatedInputs,
+              InputMetadataProvider metadataProvider) {
             return () -> {};
           }
         };

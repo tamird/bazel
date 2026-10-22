@@ -127,10 +127,11 @@ public final class RemoteRewoundActionSynchronizer implements RewoundActionSynch
   scheduling dependencies, which are the artifacts it may read during discovery. For a tree
   artifact input, this is the action that generates the tree artifact, or the actions expanded
   from an ActionTemplate that populate it, including producers of empty subdirectories. In either
-  case, the reader depends on that action: ActionExecutionFunction requests all inputs and
-  scheduling dependencies before discovering inputs and all discovered inputs before executing,
-  and ArtifactFunction resolves an artifact by requesting its generating action, or, for a tree
-  artifact declared by a template, exactly the expanded actions that populate it.
+  case, the reader depends on that action: ActionExecutionFunction requests the evaluated inputs
+  (including inputs restored from the action cache) and scheduling dependencies before discovering
+  inputs, and all discovered inputs before executing. ArtifactFunction resolves an artifact by
+  requesting its generating action, or, for a tree artifact declared by a template, exactly the
+  expanded actions that populate it.
 
   Thus an action that holds or waits for the read lock of K depends on any action that can acquire
   the write lock of K.
@@ -281,13 +282,13 @@ public final class RemoteRewoundActionSynchronizer implements RewoundActionSynch
   }
 
   @Override
-  public SilentCloseable enterInputDiscovery(Action action, InputMetadataProvider metadataProvider)
+  public SilentCloseable enterInputDiscovery(
+      Action action, Iterable<Artifact> evaluatedInputs, InputMetadataProvider metadataProvider)
       throws InterruptedException {
     try (SilentCloseable c =
         Profiler.instance().profile(ProfilerTask.ACTION_LOCK, "action.enterInputDiscovery")) {
       return lockArtifactsForConsumption(
-          Iterables.concat(
-              action.getInputs().toList(), action.getSchedulingDependencies().toList()),
+          Iterables.concat(evaluatedInputs, action.getSchedulingDependencies().toList()),
           metadataProvider);
     }
   }
