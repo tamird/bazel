@@ -141,8 +141,11 @@ cc_binary(
         "posix/tw_main.cc",
         "posix/tw_outputs.cc",
         "posix/tw_outputs.h",
+        "posix/xml.cc",
         "test_wrapper_common.cc",
         "test_wrapper_common.h",
+        "test_xml.cc",
+        "test_xml.h",
     ],
     target_compatible_with = select({
         "@bazel_tools//src/conditions:darwin": [],

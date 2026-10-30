@@ -1105,6 +1105,10 @@ public class TestRunnerAction extends AbstractAction
     return testSetupScript;
   }
 
+  public boolean usesTestWrapperForXml() {
+    return testSetupScript.equals(testXmlGeneratorScript);
+  }
+
   public Artifact getTestXmlGeneratorScript() {
     return testXmlGeneratorScript;
   }

@@ -78,7 +78,7 @@ cc_binary(
 
 cc_binary(
     name = "posix_tw",
-    srcs = ["posix/tw_main.cc"],
+    srcs = ["posix/tw_main.cc", "posix/xml.cc"],
     target_compatible_with = select({
         "@bazel_tools//src/conditions:darwin": [],
         "@bazel_tools//src/conditions:linux": [],
@@ -91,7 +91,7 @@ cc_binary(
 # Shared test wrapper implementation for Windows, Linux, and macOS.
 cc_library(
     name = "tw_lib",
-    srcs = ["test_wrapper_common.cc"] + select({
+    srcs = ["test_wrapper_common.cc", "test_xml.cc"] + select({
         "@bazel_tools//src/conditions:darwin": [
             "posix/tw.cc",
             "posix/tw_outputs.cc",
@@ -103,7 +103,7 @@ cc_library(
         "@bazel_tools//src/conditions:windows": ["windows/tw.cc"],
         "//conditions:default": ["empty_test_wrapper.cc"],
     }),
-    hdrs = ["test_wrapper_common.h"] + select({
+    hdrs = ["test_wrapper_common.h", "test_xml.h"] + select({
         "@bazel_tools//src/conditions:darwin": ["posix/tw_outputs.h"],
         "@bazel_tools//src/conditions:linux": ["posix/tw_outputs.h"],
         "@bazel_tools//src/conditions:windows": ["windows/tw.h"],
@@ -132,7 +132,7 @@ cc_library(
 
 cc_test(
     name = "tw_test",
-    srcs = select({
+    srcs = ["test_xml_test.cc"] + select({
         "@bazel_tools//src/conditions:darwin": ["posix/tw_test.cc"],
         "@bazel_tools//src/conditions:linux": ["posix/tw_test.cc"],
         "@bazel_tools//src/conditions:windows": ["windows/tw_test.cc"],
@@ -170,9 +170,12 @@ filegroup(
         "posix/tw_main.cc",
         "posix/tw_outputs.cc",
         "posix/tw_outputs.h",
+        "posix/xml.cc",
         "test-setup.sh",
         "test_wrapper_common.cc",
         "test_wrapper_common.h",
+        "test_xml.cc",
+        "test_xml.h",
     ] + select({
         "@bazel_tools//src/conditions:darwin": [
             "dummy.sh",

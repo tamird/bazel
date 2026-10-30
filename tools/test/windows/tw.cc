@@ -18,6 +18,7 @@
 
 #include "tools/test/windows/tw.h"
 
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -36,6 +37,7 @@
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -49,6 +51,7 @@
 #include "third_party/ijar/common.h"
 #include "third_party/ijar/platform_utils.h"
 #include "third_party/ijar/zip.h"
+#include "tools/test/test_xml.h"
 
 namespace bazel {
 namespace tools {
@@ -103,50 +106,6 @@ class TeeImpl : Tee {
   bazel::windows::AutoHandle output2_;
 };
 
-// Buffered input stream (based on a Windows HANDLE) with peek-ahead support.
-//
-// This class uses two consecutive "pages" where it buffers data from the
-// underlying HANDLE (wrapped in an AutoHandle). Both pages are always loaded
-// with data until there's no more data to read.
-//
-// The "active" page is the one where the read cursor is pointing. The other
-// page is the next one to be read once the client moves the read cursor beyond
-// the end of the active page.
-//
-// The client advances the read cursor with Advance(). When the cursor reaches
-// the end of the active page, the other page becomes the active one (whose data
-// is already buffered), and the old active page is loaded with new data from
-// the underlying file.
-class IFStreamImpl : IFStream {
- public:
-  // Creates a new IFStream.
-  //
-  // If successful, then takes ownership of the HANDLE in 'handle', and returns
-  // a new IFStream pointer. Otherwise leaves 'handle' alone and returns
-  // nullptr.
-  static IFStream* Create(HANDLE handle, DWORD page_size = 0x100000 /* 1 MB */);
-
-  int Get() override;
-  DWORD Peek(DWORD n, uint8_t* out) const override;
-
- private:
-  HANDLE handle_;
-  const std::unique_ptr<uint8_t[]> pages_;
-  const DWORD page_size_;
-  DWORD pos_, end_, next_size_;
-
-  IFStreamImpl(HANDLE handle, std::unique_ptr<uint8_t[]>&& pages, DWORD n,
-               DWORD page_size)
-      : handle_(handle),
-        pages_(std::move(pages)),
-        page_size_(page_size),
-        pos_(0),
-        end_(n < page_size ? n : page_size),
-        next_size_(n < page_size
-                       ? 0
-                       : (n < page_size * 2 ? n - page_size : page_size)) {}
-};
-
 // A lightweight path abstraction that stores a Unicode Windows path.
 //
 // The class allows extracting the underlying path as a (immutable) string so
@@ -187,9 +146,6 @@ struct Duration {
 
   bool FromString(const wchar_t* str);
 };
-
-enum class MainType { kTestWrapperMain, kXmlWriterMain };
-enum class DeleteAfterwards { kEnabled, kDisabled };
 
 void WriteStdout(const std::string& s) {
   DWORD written;
@@ -1553,103 +1509,13 @@ int RunSubprocess(const Path& test_path, const std::wstring& args,
   return result;
 }
 
-// Replace invalid XML characters and locate invalid CDATA sequences.
-//
-// The legal Unicode code points and ranges are U+0009, U+000A, U+000D,
-// U+0020..U+D7FF, U+E000..U+FFFD, and U+10000..U+10FFFF.
-//
-// Assuming the input is UTF-8 encoded, that translates to the following
-// regexps:
-//   [\x9\xa\xd\x20-\x7f]                         <--- (9,A,D,20-7F)
-//   [\xc0-\xdf][\x80-\xbf]                       <--- (0080-07FF)
-//   [\xe0-\xec][\x80-\xbf][\x80-\xbf]            <--- (0800-CFFF)
-//   [\xed][\x80-\x9f][\x80-\xbf]                 <--- (D000-D7FF)
-//   [\xee][\x80-\xbf][\x80-\xbf]                 <--- (E000-EFFF)
-//   [\xef][\x80-\xbe][\x80-\xbf]                 <--- (F000-FFEF)
-//   [\xef][\xbf][\x80-\xbd]                      <--- (FFF0-FFFD)
-//   [\xf0-\xf7][\x80-\xbf][\x80-\xbf][\x80-\xbf] <--- (010000-10FFFF)
-//
-// (See https://github.com/bazelbuild/bazel/issues/4691#issuecomment-408089257)
-//
-// Every octet-sequence matching one of these regexps will be left alone, all
-// other octet-sequences will be replaced by '?' characters.
-bool CdataEscape(IFStream* in, std::basic_ostream<char>* out) {
-  int c0 = in->Get();
-  uint8_t p[3];
-  for (; c0 < 256; c0 = in->Get()) {
-    if (c0 == ']' && in->Peek(2, p) == 2 && p[0] == ']' && p[1] == '>') {
-      *out << "]]>]]<![CDATA[>";
-      if (!out->good()) {
-        return false;
-      }
-      (void)in->Get();
-      (void)in->Get();
-    } else if (c0 == 0x9 || c0 == 0xA || c0 == 0xD ||
-               (c0 >= 0x20 && c0 <= 0x7F)) {
-      // Matched legal single-octet sequence.
-      *out << (char)c0;
-      if (!out->good()) {
-        return false;
-      }
-    } else if (c0 >= 0xC0 && c0 <= 0xDF && in->Peek(1, p) == 1 &&
-               p[0] >= 0x80 && p[0] <= 0xBF) {
-      // Matched legal double-octet sequence. Skip the next octet.
-      *out << (char)c0 << (char)p[0];
-      if (!out->good()) {
-        return false;
-      }
-      (void)in->Get();
-    } else if (in->Peek(2, p) == 2 &&
-               ((c0 >= 0xE0 && c0 <= 0xEC && p[0] >= 0x80 && p[0] <= 0xBF &&
-                 p[1] >= 0x80 && p[1] <= 0xBF) ||
-                (c0 == 0xED && p[0] >= 0x80 && p[0] <= 0x9F && p[1] >= 0x80 &&
-                 p[1] <= 0xBF) ||
-                (c0 == 0xEE && p[0] >= 0x80 && p[0] <= 0xBF && p[1] >= 0x80 &&
-                 p[1] <= 0xBF) ||
-                (c0 == 0xEF && p[0] >= 0x80 && p[0] <= 0xBE && p[1] >= 0x80 &&
-                 p[1] <= 0xBF) ||
-                (c0 == 0xEF && p[0] == 0xBF && p[1] >= 0x80 && p[1] <= 0xBD))) {
-      // Matched legal triple-octet sequence. Skip the next two octets.
-      *out << (char)c0 << (char)p[0] << (char)p[1];
-      if (!out->good()) {
-        return false;
-      }
-      (void)in->Get();
-      (void)in->Get();
-    } else if (in->Peek(3, p) == 3 && c0 >= 0xF0 && c0 <= 0xF7 &&
-               p[0] >= 0x80 && p[0] <= 0xBF && p[1] >= 0x80 && p[1] <= 0xBF &&
-               p[2] >= 0x80 && p[2] <= 0xBF) {
-      // Matched legal quadruple-octet sequence. Skip the next three octets.
-      *out << (char)c0 << (char)p[0] << (char)p[1] << (char)p[2];
-      if (!out->good()) {
-        return false;
-      }
-      (void)in->Get();
-      (void)in->Get();
-      (void)in->Get();
-    } else {
-      // Illegal octet; replace.
-      *out << (char)'?';
-      if (!out->good()) {
-        return false;
-      }
-    }
-  }
-  return c0 == IFStream::kIFStreamErrorEOF;
-}
-
-bool GetTestName(std::wstring* result) {
-  if (!GetEnv(L"TEST_BINARY", result) || result->empty()) {
+bool GetTestName(std::string* result) {
+  std::wstring test_binary;
+  if (!GetEnv(L"TEST_BINARY", &test_binary) || test_binary.empty() ||
+      !blaze_util::WcsToUtf8(test_binary, result)) {
     LogError(__LINE__, L"Failed to get test name");
     return false;
   }
-  if (result->size() >= 2 && (*result)[0] == '.' && (*result)[1] == '/') {
-    result->erase(0, 2);
-  } else if (result->size() >= 3 && (*result)[0] == '.' &&
-             (*result)[1] == '.' && (*result)[2] == '/') {
-    result->erase(0, 3);
-  }
-
   // Ensure that test shards have unique names in the xml output, by including
   // the shard index in the test name.
   std::wstring total_shards_str;
@@ -1665,107 +1531,50 @@ bool GetTestName(std::wstring* result) {
       LogError(__LINE__);
       return false;
     }
-    std::wstringstream stm;
-    stm << *result << L"_shard_" << (shard_index + 1) << L"/"
-        << total_shards_str;
-    *result = stm.str();
   }
-
+  *result = XmlTestName(*result, shard_index, total_shards);
   return true;
 }
 
-std::string CreateErrorTag(int exit_code) {
-  if (exit_code != 0) {
-    std::stringstream ss;
-    ss << "<error message=\"exited with error code " << exit_code
-       << "\"></error>";
-    return ss.str();
-  } else {
-    return std::string();
+// Read through the original shared handle so that other processes may still
+// rename, delete, or write the log while the XML writer has it open.
+class TestLogBuffer : public std::streambuf {
+ public:
+  explicit TestLogBuffer(HANDLE handle) : handle_(handle) {}
+  bool failed() const { return failed_; }
+
+ protected:
+  std::streamsize xsgetn(char* data, std::streamsize size) override {
+    DWORD count;
+    if (!ReadFile(handle_, data, static_cast<DWORD>(size), &count, nullptr)) {
+      failed_ = true;
+      return 0;
+    }
+    return count;
   }
-}
+
+ private:
+  HANDLE handle_;
+  bool failed_ = false;
+};
 
 bool CreateXmlLog(const Path& output, const Path& test_outerr,
-                  const Duration duration, const int exit_code,
-                  const DeleteAfterwards delete_afterwards,
-                  const MainType main_type) {
-  if (main_type != MainType::kXmlWriterMain) {
-    return true;
-  }
-
-  Defer delete_test_outerr([test_outerr, delete_afterwards]() {
-    // Delete the test's outerr file after we have the XML file.
-    // We don't care if this succeeds or not, because the outerr file is not a
-    // declared output.
-    if (delete_afterwards == DeleteAfterwards::kEnabled) {
-      DeleteFileW(test_outerr.Get().c_str());
-    }
-  });
-
-  std::wstring test_name;
-  int errors = (exit_code == 0) ? 0 : 1;
-  std::string error_msg = CreateErrorTag(exit_code);
-  if (!GetTestName(&test_name)) {
-    LogError(__LINE__);
-    return false;
-  }
-
-  std::string acp_test_name;
-  if (!WcsToAcp(test_name, &acp_test_name)) {
-    LogError(__LINE__, test_name.c_str());
-    return false;
-  }
-
-  bazel::windows::AutoHandle test_log;
-  if (!OpenExistingFileForRead(test_outerr, &test_log)) {
-    LogError(__LINE__, test_outerr.Get().c_str());
-    return false;
-  }
-
-  std::unique_ptr<IFStream> istm(IFStreamImpl::Create(test_log));
-  if (istm == nullptr) {
-    LogError(__LINE__, test_outerr.Get().c_str());
-    return false;
-  }
-
-  std::ofstream ostm(
-      AddUncPrefixMaybe(output).c_str(),
-      std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
-  if (!ostm.is_open() || !ostm.good()) {
+                  Duration duration, int exit_code) {
+  std::string test_name;
+  if (!GetTestName(&test_name)) return false;
+  bazel::windows::AutoHandle handle;
+  if (!OpenExistingFileForRead(test_outerr, &handle)) return false;
+  TestLogBuffer buffer(handle);
+  std::istream log(&buffer);
+  std::ofstream out(AddUncPrefixMaybe(output).c_str(), std::ios::binary);
+  if (!out ||
+      !WriteTestXml(log, out, test_name, duration.seconds, exit_code, "") ||
+      buffer.failed()) {
     LogError(__LINE__, output.Get().c_str());
     return false;
   }
-
-  // Create XML file stub.
-  ostm << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-          "<testsuites>\n"
-          "<testsuite name=\""
-       << acp_test_name << "\" tests=\"1\" failures=\"0\" errors=\"" << errors
-       << "\">\n"
-          "<testcase name=\""
-       << acp_test_name << "\" classname=\"\" status=\"run\" duration=\""
-       << duration.seconds << "\" time=\"" << duration.seconds << "\">"
-       << error_msg
-       << "</testcase>\n"
-          "<system-out><![CDATA[";
-  if (!ostm.good()) {
-    LogError(__LINE__, output.Get().c_str());
-    return false;
-  }
-
-  // Encode test log to make it embeddable in CDATA.
-  if (!CdataEscape(istm.get(), &ostm)) {
-    LogError(__LINE__, output.Get().c_str());
-    return false;
-  }
-
-  // Append CDATA end and closing tags.
-  ostm << "]]></system-out>\n</testsuite>\n</testsuites>\n";
-  if (!ostm.good()) {
-    LogError(__LINE__, output.Get().c_str());
-    return false;
-  }
-  return true;
+  out.close();
+  return out.good();
 }
 
 bool Duration::FromString(const wchar_t* str) {
@@ -1808,73 +1617,6 @@ Path Path::Dirname() const {
   return result;
 }
 
-IFStream* IFStreamImpl::Create(HANDLE handle, DWORD page_size) {
-  std::unique_ptr<uint8_t[]> data(new uint8_t[page_size * 2]);
-  DWORD read;
-  if (!ReadFile(handle, data.get(), page_size * 2, &read, nullptr)) {
-    DWORD err = GetLastError();
-    if (err == ERROR_BROKEN_PIPE) {
-      read = 0;
-    } else {
-      LogErrorWithValue(__LINE__, "Failed to read from file", err);
-      return nullptr;
-    }
-  }
-  return new IFStreamImpl(handle, std::move(data), read, page_size);
-}
-
-int IFStreamImpl::Get() {
-  if (pos_ == end_) {
-    return kIFStreamErrorEOF;
-  }
-
-  int result = pages_[pos_];
-  if (pos_ + 1 < end_) {
-    pos_++;
-    return result;
-  }
-
-  // Overwrite the *active* page: we are about to move off of it.
-  DWORD offs = (pos_ < page_size_) ? 0 : page_size_;
-  DWORD read;
-  if (!ReadFile(handle_, pages_.get() + offs, page_size_, &read, nullptr)) {
-    DWORD err = GetLastError();
-    if (err == ERROR_BROKEN_PIPE) {
-      // The stream is reading from a pipe, and there's no more data.
-    } else {
-      LogErrorWithValue(__LINE__, "Failed to read from file", err);
-      return kIFStreamErrorIO;
-    }
-  }
-  pos_ = (pos_ < page_size_) ? page_size_ : 0;
-  end_ = pos_ + next_size_;
-  next_size_ = read;
-  return result;
-}
-
-DWORD IFStreamImpl::Peek(DWORD n, uint8_t* out) const {
-  if (pos_ == end_) {
-    return 0;
-  }
-
-  DWORD n1 = end_ - pos_;
-  if (n1 > n) {
-    n1 = n;  // all 'n' bytes are on the current page
-  }
-  memcpy(out, pages_.get() + pos_, n1);
-  if (n1 == n) {
-    return n;
-  }
-
-  DWORD offs = (pos_ < page_size_) ? page_size_ : 0;
-  DWORD n2 = n - n1;  // how much is left to read
-  if (n2 > next_size_) {
-    n2 = next_size_;  // read no more than the other page's size
-  }
-  memcpy(out + n1, pages_.get() + offs, n2);
-  return n1 + n2;
-}
-
 }  // namespace
 
 int TestWrapperMain(int argc, wchar_t** argv) {
@@ -1898,9 +1640,7 @@ int TestWrapperMain(int argc, wchar_t** argv) {
 
   Duration test_duration;
   int result = RunSubprocess(executable, args, test_outerr, &test_duration);
-  if (!CreateXmlLog(xml_log, test_outerr, test_duration, result,
-                    DeleteAfterwards::kEnabled, MainType::kTestWrapperMain) ||
-      !ArchiveUndeclaredOutputs(undecl) ||
+  if (!ArchiveUndeclaredOutputs(undecl) ||
       !CreateUndeclaredOutputsAnnotations(undecl.annotations_dir,
                                           undecl.annotations)) {
     return 1;
@@ -1916,8 +1656,7 @@ int XmlWriterMain(int argc, wchar_t** argv) {
   if (!GetCwd(&cwd) ||
       !ParseXmlWriterArgs(argc, argv, cwd, &test_outerr, &test_xml_log,
                           &duration, &exit_code) ||
-      !CreateXmlLog(test_xml_log, test_outerr, duration, exit_code,
-                    DeleteAfterwards::kDisabled, MainType::kXmlWriterMain)) {
+      !CreateXmlLog(test_xml_log, test_outerr, duration, exit_code)) {
     return 1;
   }
 
@@ -1982,14 +1721,6 @@ bool TestOnly_CreateTee(bazel::windows::AutoHandle* input,
                         bazel::windows::AutoHandle* output2,
                         std::unique_ptr<Tee>* result) {
   return TeeImpl::Create(input, output1, output2, result);
-}
-
-bool TestOnly_CdataEncode(IFStream* in_stm, std::basic_ostream<char>* out_stm) {
-  return CdataEscape(in_stm, out_stm);
-}
-
-IFStream* TestOnly_CreateIFStream(HANDLE handle, DWORD page_size) {
-  return IFStreamImpl::Create(handle, page_size);
 }
 
 }  // namespace testing

@@ -924,7 +924,7 @@ public class TestActionBuilderTest extends BuildViewTestCase {
     assertThat(testAction.getTestSetupScript().getFilename())
         .isEqualTo("native_posix_test_wrapper_bin");
     assertThat(testAction.getTestXmlGeneratorScript().getFilename())
-        .isEqualTo("test-xml-generator.sh");
+        .isEqualTo("native_posix_test_wrapper_bin");
     assertThat(testAction.getShExecutableMaybe()).isNull();
     assertThat(
             testAction.getInputs().toList().stream()

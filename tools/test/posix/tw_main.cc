@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstring>
+
 namespace bazel {
 namespace tools {
 namespace test_wrapper {
 
+int XmlWriterMain(int argc, char** argv);
 int TestWrapperMain(int argc, char** argv);
 
 }  // namespace test_wrapper
@@ -23,5 +26,8 @@ int TestWrapperMain(int argc, char** argv);
 }  // namespace bazel
 
 int main(int argc, char** argv) {
+  if (argc > 1 && std::strcmp(argv[1], "--generate-xml") == 0) {
+    return bazel::tools::test_wrapper::XmlWriterMain(argc - 1, argv + 1);
+  }
   return bazel::tools::test_wrapper::TestWrapperMain(argc, argv);
 }
