@@ -42,7 +42,11 @@ genrule(
         "//src/conditions:darwin": DARWIN_XCODE_LOCATOR_COMPILE_COMMAND,
         "//conditions:default": "cp $< $@",
     }),
-    local = 1,
+    # Only the macOS action needs the locally installed Xcode SDK.
+    local = select({
+        "//src/conditions:darwin": True,
+        "//conditions:default": False,
+    }),
     output_to_bindir = 1,
 )
 
