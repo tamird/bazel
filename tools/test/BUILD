@@ -79,6 +79,12 @@ cc_binary(
 cc_binary(
     name = "posix_tw",
     srcs = ["posix/tw_main.cc", "posix/xml.cc"],
+    # This embedded binary also runs on Linux workers with no dynamic loader,
+    # even when their CPU and OS match the machine that runs Bazel.
+    linkopts = select({
+        "@bazel_tools//src/conditions:linux": ["-static"],
+        "//conditions:default": [],
+    }),
     target_compatible_with = select({
         "@bazel_tools//src/conditions:darwin": [],
         "@bazel_tools//src/conditions:linux": [],
