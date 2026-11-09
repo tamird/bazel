@@ -1,0 +1,91 @@
+name: Check the default registry mirror on Linux
+on:
+  push:
+    branches: [qualification/implicit-bcr-offline]
+permissions: {}
+jobs:
+  mirror:
+    if: github.repository == 'tamird/bazel' && github.actor == github.repository_owner && github.event.created && !github.event.deleted
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - name: Bind the public source and bootstrap client
+        run: |
+          set -euo pipefail
+          git init -q
+          git fetch -q --no-tags --depth=3 https://github.com/tamird/bazel.git "$GITHUB_SHA"
+          test "$(git rev-parse FETCH_HEAD^)" = a6d03b87ce5689d871074bce123ebbf25f305933
+          test "$(git rev-parse FETCH_HEAD^^)" = bb65e8a523496da74619c6678cc75ba8ca15016d
+          git switch -q --detach FETCH_HEAD^
+          mkdir -p "$RUNNER_TEMP/implicit-bcr/results" "$RUNNER_TEMP/implicit-bcr/control" "$RUNNER_TEMP/implicit-bcr/lock"
+          d="$RUNNER_TEMP/implicit-bcr"
+          curl -fsSL --retry 3 --max-time 180 https://releases.bazel.build/9.3.2/release/bazel-9.3.2-linux-x86_64 -o "$d/bazel"
+          echo "2e14c55c298752d71e8a0bbd762665ffce5966c9ad00ec5d1a8b82a58e7bfa06  $d/bazel" | sha256sum -c -
+          chmod +x "$d/bazel"
+          cat > "$d/offline" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec sudo -n unshare --net -- /bin/bash -eu -c '
+            ip link set lo up
+            test -z "$(ip -4 route show default)"
+            test -z "$(ip -6 route show default)"
+            exec sudo -n -H -u "$SUDO_USER" -- "$@"
+          ' _ "$@"
+          SH
+          chmod +x "$d/offline"
+      - name: Reproduce the implicit failure and explicit-registry control offline on Bazel 9.3.2
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/implicit-bcr"
+          cd "$d/control"
+          touch MODULE.bazel
+          args=(--batch --noworkspace_rc info release '--module_mirrors=https://bcr.bazel.build/=https://mirror.example.com')
+          if "$d/offline" "$d/bazel" "${args[@]}" > "$d/results/released-implicit.txt" 2>&1; then exit 1; fi
+          grep -F -- '--module_mirrors references registries not listed in --registries: https://bcr.bazel.build' "$d/results/released-implicit.txt"
+          "$d/offline" "$d/bazel" "${args[@]}" --registry=https://bcr.bazel.build > "$d/results/released-explicit.txt" 2>&1
+          grep -F '9.3.2' "$d/results/released-explicit.txt"
+      - name: Build the real Bazel and run its existing mirror controls
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/implicit-bcr"
+          opts=(--jobs=4 --spawn_strategy=local --test_strategy=local --embed_label=10.0.0-pre.implicit-bcr --test_output=errors)
+          "$d/bazel" test "${opts[@]}" --test_filter='testPerRegistryModuleMirrorsWithDefault testUnknownRegistryInModuleMirrors' //src/test/py/bazel:bazel_module_test > "$d/results/build-and-controls.txt" 2>&1 || { tail -60 "$d/results/build-and-controls.txt"; exit 1; }
+          cp bazel-testlogs/src/test/py/bazel/bazel_module_test/test.xml "$d/results/controls.xml"
+          "$d/bazel" shutdown
+      - name: Run the permanent implicit-registry test with only loopback available
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/implicit-bcr"
+          "$d/offline" "$d/bazel" --batch test --jobs=4 --spawn_strategy=local --test_strategy=local --embed_label=10.0.0-pre.implicit-bcr --test_output=errors --test_filter=testModuleMirrorForImplicitBcr //src/test/py/bazel:bazel_module_test > "$d/results/offline.txt" 2>&1 || { tail -60 "$d/results/offline.txt"; exit 1; }
+          cp bazel-testlogs/src/test/py/bazel/bazel_module_test/test.xml "$d/results/offline.xml"
+          python3 - "$d/results" <<'PY'
+          from pathlib import Path
+          import sys
+          import xml.etree.ElementTree as ET
+          for filename, expected in (("controls.xml", {"testPerRegistryModuleMirrorsWithDefault", "testUnknownRegistryInModuleMirrors"}), ("offline.xml", {"testModuleMirrorForImplicitBcr"})):
+              cases = ET.parse(Path(sys.argv[1]) / filename).findall(".//testcase")
+              observed = {c.attrib["name"].split(".")[-1] for c in cases}
+              assert observed == expected and all(c.find("failure") is None and c.find("error") is None and c.find("skipped") is None for c in cases), (filename, observed)
+          PY
+      - name: Compare mirror selection and lockfiles for an implicit and explicit BCR
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/implicit-bcr"
+          bin="$(realpath bazel-bin/src/bazel)"
+          cd "$d/lock"
+          echo 'bazel_dep(name="bazel_skylib", version="1.9.0")' > MODULE.bazel
+          opts=(--batch --ignore_all_rc_files mod show_repo @bazel_skylib '--module_mirrors=https://bcr.bazel.build=https://mirror.example.com' --lockfile_mode=update)
+          "$bin" "${opts[@]}" > "$d/results/implicit-repo.txt"
+          grep -F 'https://mirror.example.com/' "$d/results/implicit-repo.txt"
+          mv MODULE.bazel.lock "$d/results/implicit.lock"
+          "$bin" "${opts[@]}" --registry=https://bcr.bazel.build/ > "$d/results/explicit-repo.txt"
+          grep -F 'https://mirror.example.com/' "$d/results/explicit-repo.txt"
+          cmp "$d/results/implicit.lock" MODULE.bazel.lock
+          cmp "$d/results/implicit-repo.txt" "$d/results/explicit-repo.txt"
+          sha256sum MODULE.bazel.lock "$d/results/implicit.lock" > "$d/results/lock-digests.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && !cancelled()
+        with:
+          name: implicit-bcr-module-mirror
+          path: ${{ runner.temp }}/implicit-bcr/results/
+          retention-days: 14
